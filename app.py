@@ -118,7 +118,7 @@ if not registry.present:
     )
 
 # ----------------------------------------------------------------------------------
-# Oversell buffer (the button at the bottom of the workflow)
+# Oversell buffer
 # ----------------------------------------------------------------------------------
 st.markdown("#### 3 · Oversell buffer")
 buf_choice = st.radio(
@@ -126,7 +126,6 @@ buf_choice = st.radio(
     ["1–2 units → 0  (locked Reebelo rule)", "1 unit → 0", "No buffer (use exact POS qty)"],
     index=0,
     horizontal=True,
-    label_visibility="visible",
 )
 buffer_max = {"1–2 units → 0  (locked Reebelo rule)": 2, "1 unit → 0": 1,
               "No buffer (use exact POS qty)": 0}[buf_choice]
@@ -211,18 +210,20 @@ st.markdown("#### 5 · Download")
 today = date.today()
 csv_bytes = R.build_upload_csv(res)
 xlsx_bytes = R.build_registry_workbook(res, today, opts)
+csv_name = R.stock_update_filename(today)
+xlsx_name = R.match_review_filename(today)
 
 d1, d2 = st.columns(2)
 d1.download_button(
-    f"⬇️ Reebelo_Stock_Upload_{today.isoformat()}.csv  ({len(res.upload_rows)} rows)",
+    f"⬇️ {csv_name}  ({len(res.upload_rows)} rows)",
     data=csv_bytes,
-    file_name=f"Reebelo_Stock_Upload_{today.isoformat()}.csv",
+    file_name=csv_name,
     mime="text/csv",
 )
 d2.download_button(
-    f"⬇️ Reebelo_Match_Review_{today.isoformat()}.xlsx",
+    f"⬇️ {xlsx_name}",
     data=xlsx_bytes,
-    file_name=f"Reebelo_Match_Review_{today.isoformat()}.xlsx",
+    file_name=xlsx_name,
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 

@@ -5,13 +5,13 @@ Mister Mobile Singapore
 Reads:
   * POS Masterlist  : stock report_used device*.xlsx  (Column F = Total -> Available Quantity)
   * Reebelo export  : reebelo-export-2836-*.csv       (29 columns, Cobalt -> Inventory -> Export)
-  * SKU Registry    : Reebelo_Match_Review*.xlsx      (Locked Matches / New Masterlist SKUs /
-                                                       Match Review / Not Selling in Reebelo /
-                                                       Not on Reebelo Yet)
+  * SKU Registry    : Reebelo_Match_Review_DD-MM-YYYY.xlsx  (Locked Matches / New Masterlist SKUs /
+                                                             Match Review / Not Selling in Reebelo /
+                                                             Not on Reebelo Yet)
 
 Writes:
-  * Updated SKU Registry workbook (same 5 worksheets + Summary + Validation Errors + _ReebeloSKUs)
-  * Reebelo_Stock_Upload_YYYY-MM-DD.csv  ->  sku,price,stock,minprice,market
+  * Reebelo_Match_Review_DD-MM-YYYY.xlsx   (the SKU registry for the next run)
+  * Reebelo_Stock_Update_DD-MM-YYYY.csv    ->  sku,price,stock,minprice,market
     price / minprice / market are ALWAYS left blank so Cobalt keeps the existing prices.
 
 LOCKED RULES
@@ -63,7 +63,7 @@ DECISION_LINKED = "Linked"
 DECISION_NOT_SELLING = "Not Selling in Reebelo"
 DECISION_NOT_YET = "Not on Reebelo yet"
 
-DV_REVIEW = '"Linked (fill col I),Not Selling in Reebelo,Not on Reebelo yet"'
+DV_REVIEW = '"Linked (fill col K),Not Selling in Reebelo,Not on Reebelo yet"'
 DV_NEWML = '"Linked (fill col I),Not Selling in Reebelo,Not on Reebelo yet"'
 
 REEBELO_REQUIRED_COLS = [
@@ -130,7 +130,6 @@ NOISE_TOKENS = {
     "BY", "STANDARD", "BATTERY", "PHYSICAL", "SIM", "ESIM", "SIMS", "INCH", "GEN",
     "GENERATION", "AND", "THE", "WITH", "NEW", "USED", "REFURBISHED",
 }
-# "PLUS" comes from ONE PLUS as well - handled explicitly by brand stripping.
 
 NETWORK_TOKENS = {"5G", "4G", "LTE", "3G"}
 CONNECT_TOKENS = {"WIFI", "CELL", "CELLULAR", "BLUETOOTH", "GPS"}
@@ -140,6 +139,21 @@ COLOR_SYNONYMS = {
     "SPACE GREY": "SPACE GRAY",
     "SPACEGRAY": "SPACE GRAY",
 }
+
+
+# ----------------------------------------------------------------------------------
+# Output file names  (same convention as the iShopChangi tool: DD-MM-YYYY)
+# ----------------------------------------------------------------------------------
+def date_tag(run_date: date) -> str:
+    return run_date.strftime("%d-%m-%Y")
+
+
+def match_review_filename(run_date: date) -> str:
+    return f"Reebelo_Match_Review_{date_tag(run_date)}.xlsx"
+
+
+def stock_update_filename(run_date: date) -> str:
+    return f"Reebelo_Stock_Update_{date_tag(run_date)}.csv"
 
 
 # ----------------------------------------------------------------------------------
@@ -215,8 +229,8 @@ def model_tokens(text: str) -> frozenset:
     t = re.sub(r"\d+\s*(?:GB|TB|MB)\s*(?:GB)?\s*/\s*\d+", " ", t)
     t = re.sub(r"\d+\s*(?:GB|TB|MB)\s*(?:GB)?\b", " ", t)
     t = re.sub(r"\b\d+\s*GB\s*RAM\b", " ", t)
-    t = re.sub(r"\b(\d+(?:\.\d+)?)\s*(?:MM|INCH|\")", r" \1MM ", t)  # watch / tablet sizes
-    t = re.sub(r"(?<=\d)(?:ST|ND|RD|TH)\b", " ", t)                       # 8th Gen -> 8
+    t = re.sub(r"\b(\d+(?:\.\d+)?)\s*(?:MM|INCH|\")", r" \1MM ", t)   # watch / tablet sizes
+    t = re.sub(r"(?<=\d)(?:ST|ND|RD|TH)\b", " ", t)                   # 8th Gen -> 8
     # network / connectivity words must go before letters are split from digits (5G -> 5 + G)
     t = re.sub(r"(?<![A-Z0-9])(?:5G|4G|3G|LTE|WI-?FI|CELLULAR|CELL|BLUETOOTH|GPS)(?![A-Z0-9])", " ", t)
     t = re.sub(r"[^A-Z0-9]+", " ", t)
@@ -285,7 +299,7 @@ class PosRow:
 
     @property
     def label(self) -> str:
-        return f"{self.stock_id}:{self.model}|{self.color}"
+        return f"{self.stock_id}: {self.model} | {self.color}"
 
 
 def _strip_model_code(model: str) -> str:
@@ -499,9 +513,10 @@ def compatible(p: PosRow, r: RebRow) -> bool:
 
 
 def build_auto_matches(pos_rows: List[PosRow], reb_rows: List[RebRow]):
-    """Return (locked_map, suggestions) where
-       locked_map  : sku -> pos_id      (strict 1:1, brand+storage+model+colour all equal)
-       suggestions : sku -> (pos_id, note) for near matches (model+storage match, colour differs)
+    """Return (locked_map, suggestions, pos_hints)
+       locked_map  : sku -> pos_id   (strict 1:1, brand+storage+model+colour all equal)
+       suggestions : sku -> (pos_id, note)   for the Match Review sheet
+       pos_hints   : pos_id -> (sku, note)   for the New Masterlist SKUs sheet
     """
     pos_by_key: Dict[Tuple, List[PosRow]] = {}
     for p in pos_rows:
@@ -528,7 +543,7 @@ def build_auto_matches(pos_rows: List[PosRow], reb_rows: List[RebRow]):
             for r in rlist:
                 notes[r.sku] = (
                     f"{len(plist)} POS row(s) and {len(rlist)} Reebelo listing(s) share this "
-                    f"model/colour/storage - confirm which one is live"
+                    f"model / colour / storage - confirm which listing is the live one"
                 )
 
     # near matches: same brand + storage + model tokens, colour different
@@ -553,7 +568,7 @@ def build_auto_matches(pos_rows: List[PosRow], reb_rows: List[RebRow]):
         elif len(cands) > 1:
             suggestions[r.sku] = (
                 "",
-                "Several POS colours match this model/storage: "
+                "Several POS colours match this model / storage: "
                 + ", ".join(sorted({c.color for c in cands}))[:180],
             )
         elif r.sku in notes:
@@ -584,7 +599,7 @@ def build_auto_matches(pos_rows: List[PosRow], reb_rows: List[RebRow]):
         if best is not None and best_score >= 0.5:
             pos_hints[p.stock_id] = (
                 best.sku,
-                f"Wording differs ({int(best_score * 100)}% token match) - check model before linking",
+                f"Wording differs ({int(best_score * 100)}% token match) - check the model before linking",
             )
             suggestions.setdefault(best.sku, (p.stock_id, pos_hints[p.stock_id][1]))
     return locked, suggestions, pos_hints
@@ -822,14 +837,14 @@ def run_sync(
             p = pos_by_id.get(pid)
             if p is None:
                 missing.append(pid)
-                labels.append(f"{pid}:(not in today's POS)")
+                labels.append(f"{pid}: (not in today's POS)")
                 continue
             if p.excluded:
                 res.error_rows.append({
                     "Severity": "Warning",
                     "Issue": f"{sku}: Masterlist {pid} is {p.excluded} - counted as 0.",
                 })
-                labels.append(f"{pid}:{p.model}|{p.color} (EXCLUDED)")
+                labels.append(f"{pid}: {p.model} | {p.color} (EXCLUDED)")
                 continue
             qty += max(0, p.qty)
             labels.append(p.label)
@@ -842,6 +857,11 @@ def run_sync(
                 "Issue": (f"{sku}: Masterlist ID(s) {', '.join(missing)} are not in today's POS "
                           f"export (sold out) - counted as 0. Link kept."),
             })
+        status = "Unchanged"
+        if target != r.stock_you:
+            status = "UPDATE"
+        if qty > 0 and target == 0:
+            status = "BUFFER → 0"
         res.locked_rows.append({
             "Reebelo SKU": sku,
             "Reebelo Model Name": r.model_name,
@@ -851,10 +871,11 @@ def run_sync(
             "Condition": r.condition,
             "Storage": r.storage,
             "LOCKED Masterlist ID(s)": ", ".join(ids),
-            "ML Model(s)|Color": " ; ".join(labels),
-            "ML Available Qty": qty,
+            "Masterlist Model | Color": " ; ".join(labels),
+            "POS Available Qty": qty,
             "Current Stock (you)": r.stock_you,
             "Target Stock": target,
+            "In Upload CSV": status,
             "# IDs": len(ids),
         })
         if (not opts.changed_rows_only) or target != r.stock_you:
@@ -871,11 +892,13 @@ def run_sync(
         res.review_rows.append({
             "Reebelo SKU": r.sku,
             "Reebelo Model Name": r.model_name,
+            "Brand": r.brand,
+            "Category": r.category,
             "Color": r.color,
             "Condition": r.condition,
             "Storage": r.storage,
             "Current Seller Stock": r.stock_you,
-            "Suggested Masterlist ID": (f"{sugg_id} ({p.model} | {p.color})" if p else sugg_id),
+            "Suggested Masterlist ID": (f"{sugg_id}: {p.model} | {p.color}" if p else sugg_id),
             "Corrected Masterlist ID": prev[1],
             "Reviewer Decision": prev[0],
             "Notes": note,
@@ -916,7 +939,7 @@ def run_sync(
             "Masterlist Stock Type ID": pid,
             "Category": p.category if p else "",
             "Brand": p.brand if p else "",
-            "Model": p.model if p else "",
+            "Model": p.model if p else "(not in today's POS export)",
             "Color": p.color if p else "",
             "Available Qty": p.qty if p else 0,
         }
@@ -945,7 +968,7 @@ def run_sync(
             "Suggested Reebelo SKU": (cand[0] if cand else hint_sku),
             "Link to Reebelo SKU": prev[1],
             "Reviewer Decision": prev[0],
-            "Notes": prev[2] or hint_note,
+            "Notes": prev[2] or hint_note or "No Reebelo listing found for this model / colour",
         })
 
     # ---------------- 5. counts --------------------------------------------------
@@ -987,29 +1010,55 @@ def build_upload_csv(res: SyncResult) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
-def _style_header(ws, ncols: int, widths: List[float]):
+MIN_W, MAX_W = 9.0, 62.0
+
+
+def _autofit(ws, headers: List[str], rows: List[List[Any]]):
+    """Size every column to its widest cell so no text is cut off."""
+    ncols = len(headers)
+    widths = []
+    for i in range(ncols):
+        longest = len(str(headers[i]))
+        for r in rows:
+            if i < len(r):
+                v = r[i]
+                if v is None:
+                    continue
+                for line in str(v).split("\n"):
+                    longest = max(longest, len(line))
+        widths.append(min(max(longest + 3, MIN_W), MAX_W))
+    widths[0] = 6.0  # the "#" column
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    return widths
+
+
+def _write_sheet(wb, title: str, headers: List[str], rows: List[Dict[str, Any]],
+                 dv: Optional[Tuple[str, str]] = None, dv_rows: int = 700):
+    ws = wb.create_sheet(title)
+    all_headers = ["#"] + headers
+    ws.append(all_headers)
+    table = []
+    for n, rec in enumerate(rows, start=1):
+        line = [n] + [rec.get(h, "") for h in headers]
+        table.append(line)
+        ws.append(line)
+
     fill = PatternFill("solid", fgColor=HEADER_BG)
     font = Font(bold=True, color=HEADER_FG)
-    for c in range(1, ncols + 1):
+    for c in range(1, len(all_headers) + 1):
         cell = ws.cell(row=1, column=c)
         cell.fill = fill
         cell.font = font
-        cell.alignment = Alignment(wrap_text=True, vertical="center")
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
+        cell.alignment = Alignment(vertical="center", horizontal="left")
+    ws.row_dimensions[1].height = 22
     ws.freeze_panes = "A2"
 
+    _autofit(ws, all_headers, table)
 
-def _write_sheet(wb, title: str, headers: List[str], widths: List[float],
-                 rows: List[Dict[str, Any]], dv: Optional[Tuple[str, str]] = None,
-                 dv_rows: int = 0):
-    ws = wb.create_sheet(title)
-    ws.append(["#"] + headers)
-    for n, rec in enumerate(rows, start=1):
-        ws.append([n] + [rec.get(h, "") for h in headers])
-    _style_header(ws, len(headers) + 1, [5.0] + widths)
     last = max(1, len(rows) + 1)
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers) + 1)}{last}"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(all_headers))}{last}"
+
     if dv:
         col_letter, formula = dv
         validator = DataValidation(type="list", formula1=formula, allow_blank=True, showDropDown=False)
@@ -1028,10 +1077,11 @@ def build_registry_workbook(res: SyncResult, run_date: date, opts: Options) -> b
     ws["B2"] = "Reebelo Stock Bulk Update — Match Review"
     ws["B2"].fill = PatternFill("solid", fgColor=TITLE_BG)
     ws["B2"].font = Font(bold=True, size=15, color="FF111111")
-    ws["B3"] = f"Mister Mobile Singapore · generated {run_date.isoformat()} · POS Masterlist → Reebelo (Cobalt)"
+    ws["B3"] = (f"Mister Mobile Singapore · generated {date_tag(run_date)} · "
+                f"POS Masterlist → Reebelo (Cobalt)")
     ws["B3"].font = Font(size=9, color="FF333333")
     c = res.counts
-    buf_txt = "off" if opts.buffer_max == 0 else f"1–{opts.buffer_max} → 0"
+    buf_txt = "off (exact POS qty)" if opts.buffer_max == 0 else f"1–{opts.buffer_max} units → 0"
     lines = [
         ("Locked Matches (total)", c.get("locked_total", 0)),
         ("Locked Matches in upload CSV", c.get("locked_updated", 0)),
@@ -1044,26 +1094,27 @@ def build_registry_workbook(res: SyncResult, run_date: date, opts: Options) -> b
         ("Warnings", c.get("warnings", 0)),
         ("Brand New / accessory listings skipped", c.get("brand_new_skipped", 0)),
         ("POS used rows read", c.get("pos_used_rows", 0)),
-        ("POS rows excluded (export / freebie)", c.get("pos_excluded", 0)),
-        ("Oversell buffer", buf_txt),
+        ("POS rows excluded (export sets / freebies)", c.get("pos_excluded", 0)),
+        ("Reebelo used listings in export", c.get("reebelo_used_listings", 0)),
+        ("Oversell buffer used", buf_txt),
     ]
     r = 5
     for label, val in lines:
         ws.cell(row=r, column=2, value=label).font = Font(bold=True)
         ws.cell(row=r, column=3, value=val)
         r += 1
-    ws.cell(row=r + 1, column=2, value="Reminder: price, minprice and market stay BLANK in the upload CSV "
-                                       "(columns kept, values empty) — stock only.").font = Font(color="FFB00020", bold=True)
+    ws.cell(row=r + 1, column=2,
+            value=("Reminder: price, minprice and market stay BLANK in the upload CSV "
+                   "(columns kept, values empty) — stock only.")).font = Font(color="FFB00020", bold=True)
     ws.column_dimensions["A"].width = 4
-    ws.column_dimensions["B"].width = 46
-    ws.column_dimensions["C"].width = 14
+    ws.column_dimensions["B"].width = 52
+    ws.column_dimensions["C"].width = 22
 
     _write_sheet(
         wb, SHEET_LOCKED,
         ["Reebelo SKU", "Reebelo Model Name", "Brand", "Category", "Color", "Condition",
-         "Storage", "LOCKED Masterlist ID(s)", "ML Model(s)|Color", "ML Available Qty",
-         "Current Stock (you)", "Target Stock", "# IDs"],
-        [48, 52, 12, 14, 16, 12, 10, 22, 40, 14, 14, 12, 7],
+         "Storage", "LOCKED Masterlist ID(s)", "Masterlist Model | Color", "POS Available Qty",
+         "Current Stock (you)", "Target Stock", "In Upload CSV", "# IDs"],
         res.locked_rows,
     )
 
@@ -1071,35 +1122,35 @@ def build_registry_workbook(res: SyncResult, run_date: date, opts: Options) -> b
         wb, SHEET_NEW_ML,
         ["Masterlist Stock Type ID", "Category", "Brand", "Model", "Color", "Available Qty",
          "Suggested Reebelo SKU", "Link to Reebelo SKU", "Reviewer Decision", "Notes"],
-        [22, 12, 14, 34, 18, 13, 46, 46, 22, 40],
         res.newml_rows,
-        dv=("J", DV_NEWML), dv_rows=500,
+        dv=("J", DV_NEWML),
     )
 
     _write_sheet(
         wb, SHEET_REVIEW,
-        ["Reebelo SKU", "Reebelo Model Name", "Color", "Condition", "Storage",
-         "Current Seller Stock", "Suggested Masterlist ID", "Corrected Masterlist ID",
+        ["Reebelo SKU", "Reebelo Model Name", "Brand", "Category", "Color", "Condition",
+         "Storage", "Current Seller Stock", "Suggested Masterlist ID", "Corrected Masterlist ID",
          "Reviewer Decision", "Notes"],
-        [48, 52, 16, 12, 10, 16, 34, 22, 22, 46],
         res.review_rows,
-        dv=("J", DV_REVIEW), dv_rows=500,
+        dv=("L", DV_REVIEW),
     )
 
     for title, rows in ((SHEET_NOT_SELLING, res.not_selling_rows), (SHEET_NOT_YET, res.not_yet_rows)):
         _write_sheet(
             wb, title,
             ["Masterlist Stock Type ID", "Category", "Brand", "Model", "Color", "Available Qty"],
-            [22, 12, 14, 30, 18, 13],
             rows,
         )
 
-    _write_sheet(wb, SHEET_ERRORS, ["Severity", "Issue"], [12, 110], res.error_rows)
+    _write_sheet(wb, SHEET_ERRORS, ["Severity", "Issue"], res.error_rows)
 
     ws = wb.create_sheet(SHEET_SKUS)
+    ws.append(["Reebelo SKU (used listings only)"])
+    ws["A1"].fill = PatternFill("solid", fgColor=HEADER_BG)
+    ws["A1"].font = Font(bold=True, color=HEADER_FG)
     for s in res.reebelo_skus:
         ws.append([s])
-    ws.column_dimensions["A"].width = 50
+    ws.column_dimensions["A"].width = 62
     ws.sheet_state = "hidden"
 
     out = io.BytesIO()
