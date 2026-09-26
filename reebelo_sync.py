@@ -1010,7 +1010,7 @@ def build_upload_csv(res: SyncResult) -> bytes:
     return buf.getvalue().encode("utf-8")
 
 
-MIN_W, MAX_W = 9.0, 62.0
+MIN_W, MAX_W = 9.0, 95.0
 
 
 def _autofit(ws, headers: List[str], rows: List[List[Any]]):
