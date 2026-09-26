@@ -30,6 +30,8 @@ st.markdown(
                 border-radius:4px;font-size:14px;margin:6px 0 18px 0;}
       .mm-alert {background:#FDECEA;border-left:6px solid #B00020;padding:12px 16px;
                  border-radius:4px;font-size:14px;margin:6px 0 18px 0;}
+      .mm-ok {background:#E9F7EC;border-left:6px solid #1E8E3E;padding:12px 16px;
+              border-radius:4px;font-size:14px;margin:6px 0 18px 0;}
       div[data-testid="stMetricValue"] {font-size:24px;}
       .stDownloadButton button {width:100%;font-weight:700;}
     </style>
@@ -114,11 +116,12 @@ if blocking:
 if not registry.present:
     st.warning(
         "No SKU Registry uploaded — this run **creates** one. "
-        "Download the Match Review workbook at the bottom, review it, and upload it on the next run."
+        "Download the Match Review workbook below, fill in every New Masterlist SKU decision, "
+        "and upload it on the next run."
     )
 
 # ----------------------------------------------------------------------------------
-# Oversell buffer
+# 3 · Oversell buffer
 # ----------------------------------------------------------------------------------
 st.markdown("#### 3 · Oversell buffer")
 buf_choice = st.radio(
@@ -140,7 +143,7 @@ res = R.run_sync(pos_rows, reb_rows, registry, opts)
 c = res.counts
 
 # ----------------------------------------------------------------------------------
-# Validation summary
+# 4 · Validation summary
 # ----------------------------------------------------------------------------------
 st.markdown(
     '<div class="mm-warn">💰 <b>Price is never touched.</b> The upload CSV keeps all five headers '
@@ -176,50 +179,46 @@ if res.stock_no_match:
         "Match Review or zero them manually in Cobalt.</div>",
         unsafe_allow_html=True,
     )
-    st.dataframe(pd.DataFrame(res.stock_no_match), use_container_width=True, hide_index=True)
 
 # ----------------------------------------------------------------------------------
-# Tabs
-# ----------------------------------------------------------------------------------
-tabs = st.tabs(
-    ["Upload CSV preview", R.SHEET_LOCKED, R.SHEET_REVIEW, R.SHEET_NEW_ML,
-     R.SHEET_NOT_SELLING, R.SHEET_NOT_YET, R.SHEET_ERRORS]
-)
-frames = [
-    pd.DataFrame(res.upload_rows, columns=R.UPLOAD_HEADERS),
-    pd.DataFrame(res.locked_rows),
-    pd.DataFrame(res.review_rows),
-    pd.DataFrame(res.newml_rows),
-    pd.DataFrame(res.not_selling_rows),
-    pd.DataFrame(res.not_yet_rows),
-    pd.DataFrame(res.error_rows),
-]
-for tab, frame in zip(tabs, frames):
-    with tab:
-        if frame.empty:
-            st.caption("Nothing here for this run.")
-        else:
-            st.dataframe(frame.head(3000), use_container_width=True, hide_index=True)
-            if len(frame) > 3000:
-                st.caption(f"Showing the first 3,000 of {len(frame):,} rows — the file has them all.")
-
-# ----------------------------------------------------------------------------------
-# Downloads
+# 5 · Download
+#     The Reebelo bulk upload CSV unlocks only when EVERY New Masterlist SKU
+#     has a Reviewer Decision. The Match Review workbook is always available.
 # ----------------------------------------------------------------------------------
 st.markdown("#### 5 · Download")
+
+pending = [r for r in res.newml_rows if not str(r.get("Reviewer Decision", "")).strip()]
 today = date.today()
-csv_bytes = R.build_upload_csv(res)
-xlsx_bytes = R.build_registry_workbook(res, today, opts)
 csv_name = R.stock_update_filename(today)
 xlsx_name = R.match_review_filename(today)
+xlsx_bytes = R.build_registry_workbook(res, today, opts)
+
+if pending:
+    st.markdown(
+        f'<div class="mm-alert">🔒 <b>Bulk upload CSV locked.</b> '
+        f'<b>{len(pending)}</b> of {len(res.newml_rows)} New Masterlist SKUs still have no '
+        "Reviewer Decision. Download the Match Review workbook, fill column J on the "
+        "<b>New Masterlist SKUs</b> tab for every row (Linked / Not Selling in Reebelo / "
+        "Not on Reebelo yet), then upload it again as the SKU Registry.</div>",
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        '<div class="mm-ok">✅ <b>All New Masterlist SKUs reviewed.</b> The Reebelo bulk upload '
+        "CSV is unlocked.</div>",
+        unsafe_allow_html=True,
+    )
 
 d1, d2 = st.columns(2)
-d1.download_button(
-    f"⬇️ {csv_name}  ({len(res.upload_rows)} rows)",
-    data=csv_bytes,
-    file_name=csv_name,
-    mime="text/csv",
-)
+if pending:
+    d1.button(f"🔒 {csv_name} — locked ({len(pending)} to review)", disabled=True)
+else:
+    d1.download_button(
+        f"⬇️ {csv_name}  ({len(res.upload_rows)} rows)",
+        data=R.build_upload_csv(res),
+        file_name=csv_name,
+        mime="text/csv",
+    )
 d2.download_button(
     f"⬇️ {xlsx_name}",
     data=xlsx_bytes,
