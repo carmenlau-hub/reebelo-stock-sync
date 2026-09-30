@@ -8,7 +8,6 @@ Deploy:        push to GitHub -> share.streamlit.io -> point at app.py
 
 from datetime import date
 
-import pandas as pd
 import streamlit as st
 
 import reebelo_sync as R
@@ -52,7 +51,18 @@ st.markdown(
 with st.sidebar:
     st.markdown("### 1 · Upload files")
     pos_file = st.file_uploader("POS Masterlist (used device stock report)", type=["xlsx", "xlsm"])
-    reb_file = st.file_uploader("Reebelo Bulk Stock Inventory (export CSV)", type=["csv", "xlsx", "xlsm"])
+    reb_files = st.file_uploader(
+        "Reebelo Bulk Stock Inventory (export CSV)",
+        type=["csv", "xlsx", "xlsm"],
+        accept_multiple_files=True,
+        help="You can drop more than one export here — e.g. the full export plus an "
+             "accessories-only export. Duplicate SKUs: the newest file wins.",
+    )
+    acc_file = st.file_uploader(
+        "POS Accessories stock report (optional)",
+        type=["xlsx", "xlsm"],
+        help="Leave empty and Brand New / MMACC accessory listings stay manual, exactly as before.",
+    )
     reg_file = st.file_uploader("SKU Registry (5 worksheets)", type=["xlsx", "xlsm"])
 
     st.caption(
@@ -63,33 +73,31 @@ with st.sidebar:
 
     st.markdown("### 2 · Options")
     seed = st.checkbox(
-        "Auto-lock 100% exact matches",
-        value=True,
+        "Auto-lock 100% exact matches", value=True,
         help="Brand + model + storage + colour must all match exactly, and the match must be 1-to-1. "
              "Anything less goes to Match Review.",
     )
     relink = st.checkbox(
-        "Re-link SKUs that come back into POS",
-        value=True,
+        "Re-link SKUs that come back into POS", value=True,
         help="A Masterlist SKU parked under Not Selling / Not on Reebelo Yet is moved back into "
              "Locked Matches when it has POS stock again and an exact Reebelo listing exists.",
     )
     changed_only = st.checkbox(
-        "Upload CSV = changed rows only",
-        value=True,
+        "Upload CSV = changed rows only", value=True,
         help="Only listings whose stock actually changes are written to the CSV.",
     )
 
 # ----------------------------------------------------------------------------------
 # Gate
 # ----------------------------------------------------------------------------------
-if not pos_file or not reb_file:
+if not pos_file or not reb_files:
     st.info("⬅️ Upload the **POS Masterlist** and the **Reebelo Bulk Stock Inventory** file to begin.")
     st.markdown(
         '<div class="mm-warn">🔒 <b>Locked rules.</b> Only <b>column J “stock (you)”</b> is ever '
         'changed. <b>price, minprice and market stay blank</b> in the upload CSV — the columns are '
-        'kept, the values are empty — so Cobalt keeps your existing price and min price. Used sets '
-        'only: Brand New / MMACC accessory listings are skipped and stay manual.</div>',
+        'kept, the values are empty — so Cobalt keeps your existing price and min price. '
+        'Brand New / MMACC accessories are only synced when you also upload the accessories POS '
+        'report; Grade A / Grade B cables and adapters are never auto-matched.</div>',
         unsafe_allow_html=True,
     )
     st.stop()
@@ -100,8 +108,10 @@ if not pos_file or not reb_file:
 blocking = []
 pos_rows, pos_err = R.load_pos(pos_file)
 blocking += pos_err
-reb_rows, reb_df, reb_err = R.load_reebelo(reb_file, getattr(reb_file, "name", ""))
+reb_rows, reb_df, reb_err = R.load_reebelo(reb_files)
 blocking += reb_err
+acc_rows, acc_err = R.load_pos_accessories(acc_file)
+blocking += acc_err
 registry, reg_err = R.load_registry(reg_file) if reg_file else (R.Registry(), [])
 blocking += reg_err
 
@@ -120,26 +130,43 @@ if not registry.present:
         "and upload it on the next run."
     )
 
+if not acc_rows:
+    st.info(
+        "No accessories POS report uploaded — the Brand New / MMACC listings are skipped and "
+        "stay manual. Upload `stock_report_..._accessories_new.xlsx` in the sidebar to include them."
+    )
+
 # ----------------------------------------------------------------------------------
 # 3 · Oversell buffer
 # ----------------------------------------------------------------------------------
 st.markdown("#### 3 · Oversell buffer")
-buf_choice = st.radio(
-    "Zero out low POS stock so the last unit is never oversold:",
-    ["1–2 units → 0  (locked Reebelo rule)", "1 unit → 0", "No buffer (use exact POS qty)"],
-    index=0,
-    horizontal=True,
-)
+b1, b2 = st.columns(2)
+with b1:
+    dev_choice = st.radio(
+        "Used devices",
+        ["1–2 units → 0  (locked Reebelo rule)", "1 unit → 0", "No buffer (exact POS qty)"],
+        index=0,
+    )
+with b2:
+    acc_choice = st.radio(
+        "Accessories",
+        ["No buffer (exact POS qty)", "1–5 units → 0", "1–10 units → 0", "1–2 units → 0"],
+        index=0,
+        disabled=not acc_rows,
+    )
 buffer_max = {"1–2 units → 0  (locked Reebelo rule)": 2, "1 unit → 0": 1,
-              "No buffer (use exact POS qty)": 0}[buf_choice]
+              "No buffer (exact POS qty)": 0}[dev_choice]
+acc_buffer_max = {"No buffer (exact POS qty)": 0, "1–5 units → 0": 5,
+                  "1–10 units → 0": 10, "1–2 units → 0": 2}[acc_choice]
 
 opts = R.Options(
     buffer_max=buffer_max,
+    acc_buffer_max=acc_buffer_max,
     relink_returning=relink,
     changed_rows_only=changed_only,
     seed_auto_lock=seed,
 )
-res = R.run_sync(pos_rows, reb_rows, registry, opts)
+res = R.run_sync(pos_rows, reb_rows, registry, opts, acc_rows=acc_rows)
 c = res.counts
 
 # ----------------------------------------------------------------------------------
@@ -160,16 +187,24 @@ r1[2].metric("SKUs requiring review", c["review"])
 r1[3].metric("Zeroed by buffer", c["locked_buffered"])
 
 r2 = st.columns(4)
-r2[0].metric("Not Selling in Reebelo", c["not_selling"])
-r2[1].metric("Not on Reebelo Yet", c["not_yet"])
+r2[0].metric("Locked — used devices", c["locked_devices"])
+r2[1].metric("Locked — accessories", c["locked_accessories"])
 r2[2].metric("Validation errors", c["errors"])
 r2[3].metric("Unmatched with stock", c["unmatched_with_stock"])
 
+r3 = st.columns(4)
+r3[0].metric("Not Selling in Reebelo", c["not_selling"])
+r3[1].metric("Not on Reebelo Yet", c["not_yet"])
+r3[2].metric("Accessories on shared pools", c["shared_pools"],
+             help=f"One POS pool feeding several listings. Full qty at {opts.share_threshold}+ "
+                  "pieces, split evenly below that.")
+r3[3].metric("Accessory listings to review", c["review_accessories"])
+
 st.caption(
     f"Locked Matches total {c['locked_total']} · Reebelo used listings {c['reebelo_used_listings']} · "
-    f"Brand New / accessory listings skipped {c['brand_new_skipped']} · "
-    f"POS used rows {c['pos_used_rows']} · POS rows excluded (export sets / freebies) {c['pos_excluded']} · "
-    f"Warnings {c['warnings']}"
+    f"Reebelo accessory listings {c['reebelo_acc_listings']} · "
+    f"POS used rows {c['pos_used_rows']} · POS accessory rows {c['pos_acc_rows']} · "
+    f"POS rows excluded (export sets / freebies) {c['pos_excluded']} · Warnings {c['warnings']}"
 )
 
 if res.stock_no_match:
@@ -197,8 +232,8 @@ if pending:
     st.markdown(
         f'<div class="mm-alert">🔒 <b>Bulk upload CSV locked.</b> '
         f'<b>{len(pending)}</b> of {len(res.newml_rows)} New Masterlist SKUs still have no '
-        "Reviewer Decision. Download the Match Review workbook, fill column J on the "
-        "<b>New Masterlist SKUs</b> tab for every row (Linked / Not Selling in Reebelo / "
+        "Reviewer Decision. Download the Match Review workbook, fill the Reviewer Decision column "
+        "on the <b>New Masterlist SKUs</b> tab for every row (Linked / Not Selling in Reebelo / "
         "Not on Reebelo yet), then upload it again as the SKU Registry.</div>",
         unsafe_allow_html=True,
     )
@@ -215,14 +250,10 @@ if pending:
 else:
     d1.download_button(
         f"⬇️ {csv_name}  ({len(res.upload_rows)} rows)",
-        data=R.build_upload_csv(res),
-        file_name=csv_name,
-        mime="text/csv",
+        data=R.build_upload_csv(res), file_name=csv_name, mime="text/csv",
     )
 d2.download_button(
-    f"⬇️ {xlsx_name}",
-    data=xlsx_bytes,
-    file_name=xlsx_name,
+    f"⬇️ {xlsx_name}", data=xlsx_bytes, file_name=xlsx_name,
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 

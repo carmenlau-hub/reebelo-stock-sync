@@ -3,11 +3,10 @@ Reebelo Stock Sync — core engine
 Mister Mobile Singapore
 
 Reads:
-  * POS Masterlist  : stock report_used device*.xlsx  (Column F = Total -> Available Quantity)
-  * Reebelo export  : reebelo-export-2836-*.csv       (29 columns, Cobalt -> Inventory -> Export)
-  * SKU Registry    : Reebelo_Match_Review_DD-MM-YYYY.xlsx  (Locked Matches / New Masterlist SKUs /
-                                                             Match Review / Not Selling in Reebelo /
-                                                             Not on Reebelo Yet)
+  * POS Masterlist (devices)     : stock report_used device*.xlsx   (Column F = Total -> Available Quantity)
+  * POS Accessories (optional)   : stock_report_*_accessories_new.xlsx
+  * Reebelo export(s)            : reebelo-export-*.csv  (29 columns, Cobalt -> Inventory -> Export)
+  * SKU Registry                 : Reebelo_Match_Review_DD-MM-YYYY.xlsx
 
 Writes:
   * Reebelo_Match_Review_DD-MM-YYYY.xlsx   (the SKU registry for the next run)
@@ -16,8 +15,10 @@ Writes:
 
 LOCKED RULES
   - Only column J "stock (you)" is ever changed. Price, min price, competitor stock: never.
-  - Used sets only. Brand New / MMACC accessories are skipped (manual).
-  - Oversell buffer: POS Available Qty 1-2  ->  0   (configurable)
+  - Used devices: oversell buffer 1-2 -> 0 (configurable).
+  - Accessories (Brand New / MMACC): only synced when the accessories POS report is uploaded.
+    Own buffer (default: none). Grade A / Grade B items are never auto-matched.
+    Shared pools: full qty per listing while the pool is healthy, split evenly when thin.
   - Anything that is not a 100% match is NOT uploaded; it is flagged for review.
 """
 
@@ -34,6 +35,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+
+import reebelo_acc as ACC
 
 # ----------------------------------------------------------------------------------
 # Branding (copied from the TikTok Stock Sync tool)
@@ -52,33 +55,20 @@ SHEET_SKUS = "_ReebeloSKUs"
 SHEET_SUMMARY = "Summary"
 
 REQUIRED_REGISTRY_SHEETS = [
-    SHEET_LOCKED,
-    SHEET_NEW_ML,
-    SHEET_REVIEW,
-    SHEET_NOT_SELLING,
-    SHEET_NOT_YET,
+    SHEET_LOCKED, SHEET_NEW_ML, SHEET_REVIEW, SHEET_NOT_SELLING, SHEET_NOT_YET,
 ]
 
 DECISION_LINKED = "Linked"
 DECISION_NOT_SELLING = "Not Selling in Reebelo"
 DECISION_NOT_YET = "Not on Reebelo yet"
 
-DV_REVIEW = '"Linked (fill col K),Not Selling in Reebelo,Not on Reebelo yet"'
-DV_NEWML = '"Linked (fill col I),Not Selling in Reebelo,Not on Reebelo yet"'
+SRC_DEVICE = "Device"
+SRC_ACCESSORY = "Accessory"
 
 REEBELO_REQUIRED_COLS = [
-    "sku",
-    "psku",
-    "price",
-    "min price",
-    "stock (you)",
-    "stock (all)",
-    "reebelo model name",
-    "reebelo brand",
-    "reebelo category",
-    "reebelo color",
-    "reebelo condition",
-    "reebelo storage",
+    "sku", "psku", "price", "min price", "stock (you)", "stock (all)",
+    "reebelo model name", "reebelo brand", "reebelo category", "reebelo color",
+    "reebelo condition", "reebelo storage",
 ]
 
 UPLOAD_HEADERS = ["sku", "price", "stock", "minprice", "market"]
@@ -91,39 +81,17 @@ EXPORT_TOKENS = {
 }
 
 BRAND_MAP = {
-    "IPHONE": "Apple",
-    "IPAD": "Apple",
-    "APPLE": "Apple",
-    "APPLE WATCH": "Apple",
-    "MACBOOK": "Apple",
-    "SAMSUNG": "Samsung",
-    "SAMSUNG WATCH": "Samsung",
-    "SAMSUNG TAB": "Samsung",
-    "GOOGLE": "Google",
-    "GOOGLE WATCH": "Google",
-    "PIXEL": "Google",
-    "XIAOMI": "Xiaomi",
-    "REDMI": "Xiaomi",
-    "POCO": "Xiaomi",
-    "HUAWEI": "Huawei",
-    "HONOR": "Honor",
-    "HONOR TABLET": "Honor",
-    "ONE PLUS": "OnePlus",
-    "ONEPLUS": "OnePlus",
-    "OPPO": "OPPO",
-    "OPPO WATCH": "OPPO",
-    "NOTHING": "Nothing",
-    "CMF BY NOTHING": "Nothing",
-    "CMF": "Nothing",
-    "SONY": "Sony",
-    "LENOVO": "Lenovo",
-    "VIVO": "Vivo",
-    "ASUS": "Asus",
-    "MOTOROLA": "Motorola",
-    "REALME": "Realme",
+    "IPHONE": "Apple", "IPAD": "Apple", "APPLE": "Apple", "APPLE WATCH": "Apple",
+    "MACBOOK": "Apple", "SAMSUNG": "Samsung", "SAMSUNG WATCH": "Samsung",
+    "SAMSUNG TAB": "Samsung", "GOOGLE": "Google", "GOOGLE WATCH": "Google",
+    "PIXEL": "Google", "XIAOMI": "Xiaomi", "REDMI": "Xiaomi", "POCO": "Xiaomi",
+    "HUAWEI": "Huawei", "HONOR": "Honor", "HONOR TABLET": "Honor",
+    "ONE PLUS": "OnePlus", "ONEPLUS": "OnePlus", "OPPO": "OPPO", "OPPO WATCH": "OPPO",
+    "NOTHING": "Nothing", "CMF BY NOTHING": "Nothing", "CMF": "Nothing",
+    "SONY": "Sony", "LENOVO": "Lenovo", "VIVO": "Vivo", "ASUS": "Asus",
+    "MOTOROLA": "Motorola", "REALME": "Realme",
 }
 
-# Tokens dropped from the model token-set on BOTH sides before comparing
 NOISE_TOKENS = {
     "APPLE", "SAMSUNG", "GALAXY", "GOOGLE", "XIAOMI", "HUAWEI", "HONOR", "ONEPLUS",
     "ONE", "OPPO", "NOTHING", "SONY", "LENOVO", "VIVO", "ASUS", "MOTOROLA", "REALME",
@@ -134,11 +102,7 @@ NOISE_TOKENS = {
 NETWORK_TOKENS = {"5G", "4G", "LTE", "3G"}
 CONNECT_TOKENS = {"WIFI", "CELL", "CELLULAR", "BLUETOOTH", "GPS"}
 
-COLOR_SYNONYMS = {
-    "GREY": "GRAY",
-    "SPACE GREY": "SPACE GRAY",
-    "SPACEGRAY": "SPACE GRAY",
-}
+COLOR_SYNONYMS = {"GREY": "GRAY", "SPACE GREY": "SPACE GRAY", "SPACEGRAY": "SPACE GRAY"}
 
 
 # ----------------------------------------------------------------------------------
@@ -177,7 +141,6 @@ def _int(v: Any, default: int = 0) -> int:
 
 
 def _id(v: Any) -> str:
-    """Normalise a Masterlist Stock Type ID to a clean string (30244.0 -> 30244)."""
     t = _s(v)
     if not t:
         return ""
@@ -194,50 +157,39 @@ def split_ids(v: Any) -> List[str]:
     t = _s(v)
     if not t:
         return []
-    parts = re.split(r"[,;/|\s]+", t)
-    return [_id(p) for p in parts if _id(p)]
+    return [_id(p) for p in re.split(r"[,;/|\s]+", t) if _id(p)]
 
 
 def norm_color(v: Any) -> str:
     t = re.sub(r"[^A-Z0-9 ]+", " ", _s(v).upper())
     t = re.sub(r"\s+", " ", t).strip()
     t = COLOR_SYNONYMS.get(t, t)
-    t = re.sub(r"\bGREY\b", "GRAY", t)
-    return t.strip()
+    return re.sub(r"\bGREY\b", "GRAY", t).strip()
 
 
 def norm_storage(v: Any) -> str:
-    """'64GBGB/4' -> 64GB, 'M1 512GB/8' -> 512GB, '1TB' -> 1TB."""
     t = _s(v).upper()
     m = re.search(r"(?<![A-Z0-9])(\d+)\s*(TB|GB|MB)", t)
-    if not m:
-        return ""
-    return f"{int(m.group(1))}{m.group(2)}"
+    return f"{int(m.group(1))}{m.group(2)}" if m else ""
 
 
 def _split_alpha_digit(text: str) -> str:
     text = re.sub(r"(?<=[A-Z])(?=\d)", " ", text)
-    text = re.sub(r"(?<=\d)(?=[A-Z])", " ", text)
-    return text
+    return re.sub(r"(?<=\d)(?=[A-Z])", " ", text)
 
 
 def model_tokens(text: str) -> frozenset:
-    """Canonical token set for a model string (POS or Reebelo)."""
-    t = _s(text).upper()
-    t = t.replace("+", " PLUS ")
-    # strip capacity (and the /RAM that may follow it) BEFORE splitting letters from digits
+    t = _s(text).upper().replace("+", " PLUS ")
     t = re.sub(r"\d+\s*(?:GB|TB|MB)\s*(?:GB)?\s*/\s*\d+", " ", t)
     t = re.sub(r"\d+\s*(?:GB|TB|MB)\s*(?:GB)?\b", " ", t)
     t = re.sub(r"\b\d+\s*GB\s*RAM\b", " ", t)
-    t = re.sub(r"\b(\d+(?:\.\d+)?)\s*(?:MM|INCH|\")", r" \1MM ", t)   # watch / tablet sizes
-    t = re.sub(r"(?<=\d)(?:ST|ND|RD|TH)\b", " ", t)                   # 8th Gen -> 8
-    # network / connectivity words must go before letters are split from digits (5G -> 5 + G)
+    t = re.sub(r"\b(\d+(?:\.\d+)?)\s*(?:MM|INCH|\")", r" \1MM ", t)
+    t = re.sub(r"(?<=\d)(?:ST|ND|RD|TH)\b", " ", t)
     t = re.sub(r"(?<![A-Z0-9])(?:5G|4G|3G|LTE|WI-?FI|CELLULAR|CELL|BLUETOOTH|GPS)(?![A-Z0-9])", " ", t)
     t = re.sub(r"[^A-Z0-9]+", " ", t)
     t = _split_alpha_digit(t)
-    toks = [x for x in t.split() if x]
     out = []
-    for x in toks:
+    for x in t.split():
         if x in NOISE_TOKENS or x in NETWORK_TOKENS or x in CONNECT_TOKENS:
             continue
         if x in ("GB", "TB", "MB", "RAM"):
@@ -255,10 +207,7 @@ def network_of(text: str) -> str:
 
 
 def conn_of(text: str) -> str:
-    """Cellular vs WiFi-only (iPads, watches). WiFi/Bluetooth/GPS are treated as the
-    same 'no mobile data' pool; Cellular/LTE as the mobile-data pool."""
-    t = _s(text).upper()
-    t = re.sub(r"\bE-?SIM\b", " ", t)   # "1 Physical SIM + eSIM" is not a WiFi/Cellular marker
+    t = re.sub(r"\bE-?SIM\b", " ", _s(text).upper())
     if re.search(r"\b(CELL|CELLULAR|LTE)\b", t):
         return "CELL"
     if re.search(r"\b(WI-?FI|BLUETOOTH|GPS)\b", t):
@@ -272,13 +221,35 @@ def ram_of(text: str) -> str:
     if m:
         return m.group(1)
     m = re.search(r"\d+\s*(?:GB|TB)\s*/\s*(\d+)", t)
-    if m:
-        return m.group(1)
-    return ""
+    return m.group(1) if m else ""
+
+
+def _rewind(f):
+    try:
+        f.seek(0)
+    except Exception:
+        pass
+    return f
+
+
+def _read_grid(file_like):
+    wb = load_workbook(_rewind(file_like), data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+    return [list(r) for r in ws.iter_rows(values_only=True)]
+
+
+def _qty_column(head1: List[str], head2: List[str]) -> Optional[int]:
+    for i, h in enumerate(head2):
+        if h.lower() == "available quantity":
+            return i
+    for i, h in enumerate(head1):
+        if h.lower() in ("available quantity", "total available"):
+            return i
+    return None
 
 
 # ----------------------------------------------------------------------------------
-# POS Masterlist
+# POS Masterlist — used devices
 # ----------------------------------------------------------------------------------
 @dataclass
 class PosRow:
@@ -288,7 +259,7 @@ class PosRow:
     model: str
     color: str
     qty: int
-    excluded: str = ""          # reason if the row must never be sold
+    excluded: str = ""
     brand_canon: str = ""
     storage: str = ""
     ram: str = ""
@@ -303,108 +274,96 @@ class PosRow:
 
 
 def _strip_model_code(model: str) -> str:
-    """S26 ULTRA 256GB/12 5G-S948B  ->  S26 ULTRA 256GB/12 5G"""
     return re.sub(r"-\s*[A-Z0-9]{3,8}\s*$", "", _s(model).upper()).strip()
 
 
-def _rewind(f):
-    """Streamlit UploadedFile objects keep their read position between reruns."""
-    try:
-        f.seek(0)
-    except Exception:
-        pass
-    return f
-
-
 def load_pos(file_like) -> Tuple[List[PosRow], List[str]]:
-    """Return (rows, errors). Only Category == Used rows are returned."""
     errors: List[str] = []
-    file_like = _rewind(file_like)
-    wb = load_workbook(file_like, data_only=True, read_only=True)
-    ws = wb[wb.sheetnames[0]]
-    grid = [list(r) for r in ws.iter_rows(values_only=True)]
+    grid = _read_grid(file_like)
     if len(grid) < 3:
         return [], ["POS Masterlist: file has no data rows."]
-
     head1 = [_s(x) for x in grid[0]]
     head2 = [_s(x) for x in grid[1]]
-
-    qty_idx = None
-    for i, h in enumerate(head2):
-        if h.lower() == "available quantity":
-            qty_idx = i
-            break
-    if qty_idx is None:
-        for i, h in enumerate(head1):
-            if h.lower() in ("available quantity", "total available"):
-                qty_idx = i
-                break
+    qty_idx = _qty_column(head1, head2)
     if qty_idx is None:
         return [], ["POS Masterlist: could not find the 'Total -> Available Quantity' column."]
-
-    def col_of(name: str, default: int) -> int:
-        for i, h in enumerate(head1):
-            if h.lower() == name:
-                return i
-        return default
-
-    c_id = col_of("stock type id", 0)
-    c_cat = col_of("category", 1)
-    c_brand = col_of("brand", 2)
-    c_model = col_of("model", 3)
-    c_color = col_of("color", 4)
 
     rows: List[PosRow] = []
     for raw in grid[2:]:
         if raw is None or all(x is None for x in raw):
             continue
-        sid = _id(raw[c_id] if c_id < len(raw) else None)
+        sid = _id(raw[0] if len(raw) > 0 else None)
         if not sid:
             continue
-        cat = _s(raw[c_cat] if c_cat < len(raw) else "")
+        cat = _s(raw[1] if len(raw) > 1 else "")
         if cat.upper() != "USED":
-            continue  # Reebelo sells used sets only
-        brand = _s(raw[c_brand] if c_brand < len(raw) else "")
-        model = _s(raw[c_model] if c_model < len(raw) else "")
-        color = _s(raw[c_color] if c_color < len(raw) else "")
+            continue  # Reebelo device listings are used sets only
+        brand = _s(raw[2] if len(raw) > 2 else "")
+        model = _s(raw[3] if len(raw) > 3 else "")
+        color = _s(raw[4] if len(raw) > 4 else "")
         qty = _int(raw[qty_idx] if qty_idx < len(raw) else 0)
 
         r = PosRow(sid, cat, brand, model, color, qty)
         mu = _s(model).upper()
         base = _strip_model_code(mu)
-
-        excluded = ""
         if "FREEBIE" in mu:
-            excluded = "FREEBIE row"
+            r.excluded = "FREEBIE row"
         else:
             words = set(re.split(r"[^A-Z0-9]+", base))
             hit = words & EXPORT_TOKENS
             if "SRI" in words and "LANKA" in words:
                 hit = hit | {"SRI LANKA"}
             if hit:
-                excluded = "Export set (" + ", ".join(sorted(hit)) + ")"
-        r.excluded = excluded
-
+                r.excluded = "Export set (" + ", ".join(sorted(hit)) + ")"
         r.brand_canon = BRAND_MAP.get(brand.upper().strip(), brand.title())
         r.storage = norm_storage(base)
         r.ram = ram_of(base)
         r.network = network_of(base)
         r.conn = conn_of(base)
         r.color_norm = norm_color(color)
-        family = ""
         bu = brand.upper().strip()
-        if bu.startswith("IPHONE"):
-            family = "IPHONE"
-        elif bu.startswith("IPAD"):
-            family = "IPAD"
-        elif "WATCH" in bu:
-            family = "WATCH"
+        family = "IPHONE" if bu.startswith("IPHONE") else "IPAD" if bu.startswith("IPAD") else \
+                 "WATCH" if "WATCH" in bu else ""
         r.tokens = model_tokens(f"{family} {base}")
         rows.append(r)
 
     if not rows:
         errors.append("POS Masterlist: no rows with Category = 'Used' were found.")
     return rows, errors
+
+
+# ----------------------------------------------------------------------------------
+# POS accessories
+# ----------------------------------------------------------------------------------
+def load_pos_accessories(file_like) -> Tuple[List[ACC.AccRow], List[str]]:
+    if file_like is None:
+        return [], []
+    grid = _read_grid(file_like)
+    if len(grid) < 3:
+        return [], ["POS Accessories: file has no data rows."]
+    head1 = [_s(x) for x in grid[0]]
+    head2 = [_s(x) for x in grid[1]]
+    qty_idx = _qty_column(head1, head2)
+    if qty_idx is None:
+        return [], ["POS Accessories: could not find the 'Total -> Available Quantity' column."]
+
+    rows: List[ACC.AccRow] = []
+    for raw in grid[2:]:
+        if raw is None or all(x is None for x in raw):
+            continue
+        sid = _id(raw[0] if len(raw) > 0 else None)
+        if not sid:
+            continue
+        rows.append(ACC.classify_pos_accessory(
+            sid,
+            _s(raw[1] if len(raw) > 1 else ""),
+            _s(raw[2] if len(raw) > 2 else ""),
+            _s(raw[3] if len(raw) > 3 else ""),
+            _s(raw[4] if len(raw) > 4 else ""),
+            _int(raw[qty_idx] if qty_idx < len(raw) else 0),
+        ))
+    errs = [] if rows else ["POS Accessories: no data rows were found."]
+    return rows, errs
 
 
 # ----------------------------------------------------------------------------------
@@ -431,11 +390,14 @@ class RebRow:
     conn: str = ""
     tokens: frozenset = field(default_factory=frozenset)
     color_norm: str = ""
+    acc: Optional[ACC.RebAcc] = None      # accessory parse, when the SKU is an MMACC listing
+
+    @property
+    def is_accessory(self) -> bool:
+        return self.acc is not None and self.acc.kind != "OTHER"
 
 
 def _reb_model_base(model_name: str, brand: str, storage: str) -> str:
-    """'Apple iPhone 17 Pro - 256GB - 1 Physical SIM + eSIM - Silver - Like New - ...'
-       -> 'iPhone 17 Pro'"""
     t = _s(model_name)
     parts = [p.strip() for p in t.split(" - ")]
     base = parts[0] if parts else t
@@ -448,20 +410,33 @@ def _reb_model_base(model_name: str, brand: str, storage: str) -> str:
     return base
 
 
-def load_reebelo(file_like, filename: str = "") -> Tuple[List[RebRow], pd.DataFrame, List[str]]:
+def load_reebelo(files, filename: str = "") -> Tuple[List[RebRow], pd.DataFrame, List[str]]:
+    """`files` is one uploaded file or a list of them (a full export plus, say, an
+       accessories-only export). Later files win on duplicate SKUs."""
     errors: List[str] = []
-    file_like = _rewind(file_like)
-    name = (filename or getattr(file_like, "name", "") or "").lower()
-    if name.endswith((".xlsx", ".xlsm", ".xls")):
-        df = pd.read_excel(file_like, dtype=str)
-    else:
-        df = pd.read_csv(file_like, dtype=str)
-    df.columns = [str(c).strip() for c in df.columns]
+    if files is None:
+        return [], pd.DataFrame(), ["No Reebelo inventory file uploaded."]
+    if not isinstance(files, (list, tuple)):
+        files = [files]
 
-    missing = [c for c in REEBELO_REQUIRED_COLS if c not in df.columns]
-    if missing:
-        errors.append("Reebelo inventory file is missing required column(s): " + ", ".join(missing))
-        return [], df, errors
+    frames = []
+    for f in files:
+        name = (getattr(f, "name", "") or filename or "").lower()
+        f = _rewind(f)
+        df = pd.read_excel(f, dtype=str) if name.endswith((".xlsx", ".xlsm", ".xls")) \
+            else pd.read_csv(f, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+        missing = [c for c in REEBELO_REQUIRED_COLS if c not in df.columns]
+        if missing:
+            errors.append(f"Reebelo file '{getattr(f, 'name', 'uploaded file')}' is missing "
+                          "required column(s): " + ", ".join(missing))
+            continue
+        frames.append(df)
+    if errors or not frames:
+        return [], pd.DataFrame(), errors or ["Reebelo inventory file could not be read."]
+
+    df = pd.concat(frames, ignore_index=True)
+    df = df.drop_duplicates(subset=["sku"], keep="last").reset_index(drop=True)
 
     rows: List[RebRow] = []
     for i, rec in df.iterrows():
@@ -470,20 +445,16 @@ def load_reebelo(file_like, filename: str = "") -> Tuple[List[RebRow], pd.DataFr
             continue
         cond = _s(rec.get("reebelo condition"))
         r = RebRow(
-            idx=int(i),
-            sku=sku,
-            psku=_s(rec.get("psku")),
-            model_name=_s(rec.get("reebelo model name")),
-            brand=_s(rec.get("reebelo brand")),
-            category=_s(rec.get("reebelo category")),
-            color=_s(rec.get("reebelo color")),
-            condition=cond,
-            storage=_s(rec.get("reebelo storage")),
-            stock_you=_int(rec.get("stock (you)")),
-            stock_all=_int(rec.get("stock (all)")),
+            idx=int(i), sku=sku, psku=_s(rec.get("psku")),
+            model_name=_s(rec.get("reebelo model name")), brand=_s(rec.get("reebelo brand")),
+            category=_s(rec.get("reebelo category")), color=_s(rec.get("reebelo color")),
+            condition=cond, storage=_s(rec.get("reebelo storage")),
+            stock_you=_int(rec.get("stock (you)")), stock_all=_int(rec.get("stock (all)")),
             status=_s(rec.get("status")),
         )
         r.is_brand_new = (cond.upper() == "BRAND NEW") or sku.upper().startswith("MMACC")
+        if sku.upper().startswith("MMACC"):
+            r.acc = ACC.parse_reebelo_accessory(sku)
         r.brand_canon = BRAND_MAP.get(r.brand.upper().strip(), r.brand)
         base = _reb_model_base(r.model_name, r.brand, r.storage)
         r.storage = norm_storage(r.storage) or norm_storage(r.model_name)
@@ -497,14 +468,13 @@ def load_reebelo(file_like, filename: str = "") -> Tuple[List[RebRow], pd.DataFr
 
 
 # ----------------------------------------------------------------------------------
-# Matching
+# Device matching
 # ----------------------------------------------------------------------------------
 def _hard_key(brand: str, storage: str, tokens: frozenset, color: str, conn: str = "") -> Tuple:
     return (brand.upper(), storage, tokens, color, conn)
 
 
 def compatible(p: PosRow, r: RebRow) -> bool:
-    """RAM / network are only compared when BOTH sides state them."""
     if p.ram and r.ram and p.ram != r.ram:
         return False
     if p.network and r.network and p.network != r.network:
@@ -513,11 +483,6 @@ def compatible(p: PosRow, r: RebRow) -> bool:
 
 
 def build_auto_matches(pos_rows: List[PosRow], reb_rows: List[RebRow]):
-    """Return (locked_map, suggestions, pos_hints)
-       locked_map  : sku -> pos_id   (strict 1:1, brand+storage+model+colour all equal)
-       suggestions : sku -> (pos_id, note)   for the Match Review sheet
-       pos_hints   : pos_id -> (sku, note)   for the New Masterlist SKUs sheet
-    """
     pos_by_key: Dict[Tuple, List[PosRow]] = {}
     for p in pos_rows:
         if p.excluded or not p.storage and not p.tokens:
@@ -541,12 +506,9 @@ def build_auto_matches(pos_rows: List[PosRow], reb_rows: List[RebRow]):
             locked[rlist[0].sku] = plist[0].stock_id
         elif plist:
             for r in rlist:
-                notes[r.sku] = (
-                    f"{len(plist)} POS row(s) and {len(rlist)} Reebelo listing(s) share this "
-                    f"model / colour / storage - confirm which listing is the live one"
-                )
+                notes[r.sku] = (f"{len(plist)} POS row(s) and {len(rlist)} Reebelo listing(s) share "
+                                "this model / colour / storage - confirm which listing is the live one")
 
-    # near matches: same brand + storage + model tokens, colour different
     pos_soft: Dict[Tuple, List[PosRow]] = {}
     for p in pos_rows:
         if p.excluded:
@@ -557,37 +519,31 @@ def build_auto_matches(pos_rows: List[PosRow], reb_rows: List[RebRow]):
     for r in reb_rows:
         if r.is_brand_new or r.sku in locked:
             continue
-        cands = pos_soft.get((r.brand_canon.upper(), r.storage, r.tokens, r.conn), [])
-        cands = [p for p in cands if compatible(p, r)]
+        cands = [p for p in pos_soft.get((r.brand_canon.upper(), r.storage, r.tokens, r.conn), [])
+                 if compatible(p, r)]
         if len(cands) == 1:
             p = cands[0]
-            suggestions[r.sku] = (
-                p.stock_id,
-                f"Colour differs: POS '{p.color}' vs Reebelo '{r.color}' - confirm before linking",
-            )
+            suggestions[r.sku] = (p.stock_id,
+                                  f"Colour differs: POS '{p.color}' vs Reebelo '{r.color}' - confirm before linking")
         elif len(cands) > 1:
-            suggestions[r.sku] = (
-                "",
-                "Several POS colours match this model / storage: "
-                + ", ".join(sorted({c.color for c in cands}))[:180],
-            )
+            suggestions[r.sku] = ("", "Several POS colours match this model / storage: "
+                                  + ", ".join(sorted({c.color for c in cands}))[:180])
         elif r.sku in notes:
             suggestions[r.sku] = ("", notes[r.sku])
 
-    # fuzzy hints (never auto-locked): same brand + storage + colour, model wording differs
     taken_pos = set(locked.values())
-    free_reb = [r for r in reb_rows if not r.is_brand_new and r.sku not in locked]
     by_bsc: Dict[Tuple, List[RebRow]] = {}
-    for r in free_reb:
+    for r in reb_rows:
+        if r.is_brand_new or r.sku in locked:
+            continue
         by_bsc.setdefault((r.brand_canon.upper(), r.storage, r.color_norm), []).append(r)
 
     pos_hints: Dict[str, Tuple[str, str]] = {}
     for p in pos_rows:
         if p.excluded or p.stock_id in taken_pos or p.qty <= 0:
             continue
-        cands = by_bsc.get((p.brand_canon.upper(), p.storage, p.color_norm), [])
         best, best_score = None, 0.0
-        for r in cands:
+        for r in by_bsc.get((p.brand_canon.upper(), p.storage, p.color_norm), []):
             if not compatible(p, r):
                 continue
             union = p.tokens | r.tokens
@@ -597,26 +553,22 @@ def build_auto_matches(pos_rows: List[PosRow], reb_rows: List[RebRow]):
             if score > best_score:
                 best, best_score = r, score
         if best is not None and best_score >= 0.5:
-            pos_hints[p.stock_id] = (
-                best.sku,
-                f"Wording differs ({int(best_score * 100)}% token match) - check the model before linking",
-            )
+            pos_hints[p.stock_id] = (best.sku,
+                                     f"Wording differs ({int(best_score * 100)}% token match) - check the model before linking")
             suggestions.setdefault(best.sku, (p.stock_id, pos_hints[p.stock_id][1]))
     return locked, suggestions, pos_hints
 
 
 # ----------------------------------------------------------------------------------
-# Registry (SKU Registry workbook) I/O
+# Registry I/O
 # ----------------------------------------------------------------------------------
 @dataclass
 class Registry:
-    locked: Dict[str, List[str]] = field(default_factory=dict)      # reebelo sku -> [pos ids]
+    locked: Dict[str, List[str]] = field(default_factory=dict)
     review_decisions: Dict[str, Tuple[str, str, str]] = field(default_factory=dict)
-    #   reebelo sku -> (decision, corrected_pos_id, notes)
     newml_decisions: Dict[str, Tuple[str, str, str]] = field(default_factory=dict)
-    #   pos id -> (decision, linked sku, notes)
-    not_selling: List[str] = field(default_factory=list)            # pos ids
-    not_yet: List[str] = field(default_factory=list)                # pos ids
+    not_selling: List[str] = field(default_factory=list)
+    not_yet: List[str] = field(default_factory=list)
     present: bool = False
 
 
@@ -659,8 +611,7 @@ def load_registry(file_like) -> Tuple[Registry, List[str]]:
     errors: List[str] = []
     if file_like is None:
         return reg, errors
-    file_like = _rewind(file_like)
-    wb = load_workbook(file_like, data_only=True, read_only=True)
+    wb = load_workbook(_rewind(file_like), data_only=True, read_only=True)
     missing = [s for s in REQUIRED_REGISTRY_SHEETS if s not in wb.sheetnames]
     if missing:
         errors.append("SKU Registry is missing worksheet(s): " + ", ".join(missing))
@@ -696,16 +647,12 @@ def load_registry(file_like) -> Tuple[Registry, List[str]]:
         if dec or sku:
             reg.newml_decisions[pid] = (dec, sku, note)
 
-    reg.not_selling = [
-        _id(_pick(rec, "Masterlist Stock Type ID"))
-        for rec in _sheet_records(wb[SHEET_NOT_SELLING])
-        if _id(_pick(rec, "Masterlist Stock Type ID"))
-    ]
-    reg.not_yet = [
-        _id(_pick(rec, "Masterlist Stock Type ID"))
-        for rec in _sheet_records(wb[SHEET_NOT_YET])
-        if _id(_pick(rec, "Masterlist Stock Type ID"))
-    ]
+    reg.not_selling = [_id(_pick(rec, "Masterlist Stock Type ID"))
+                       for rec in _sheet_records(wb[SHEET_NOT_SELLING])
+                       if _id(_pick(rec, "Masterlist Stock Type ID"))]
+    reg.not_yet = [_id(_pick(rec, "Masterlist Stock Type ID"))
+                   for rec in _sheet_records(wb[SHEET_NOT_YET])
+                   if _id(_pick(rec, "Masterlist Stock Type ID"))]
     return reg, errors
 
 
@@ -714,10 +661,12 @@ def load_registry(file_like) -> Tuple[Registry, List[str]]:
 # ----------------------------------------------------------------------------------
 @dataclass
 class Options:
-    buffer_max: int = 2            # POS qty <= buffer_max becomes 0 (0 disables the buffer)
-    relink_returning: bool = True  # move Not Selling / Not on Reebelo Yet back when stock returns
+    buffer_max: int = 2             # used devices: POS qty <= buffer_max becomes 0
+    acc_buffer_max: int = 0         # accessories: their own buffer (default none)
+    share_threshold: int = 30       # shared accessory pool: full qty above this, split below
+    relink_returning: bool = True
     changed_rows_only: bool = True
-    seed_auto_lock: bool = True    # first run: auto-lock 100% exact matches
+    seed_auto_lock: bool = True
 
 
 @dataclass
@@ -731,7 +680,6 @@ class SyncResult:
     upload_rows: List[Dict[str, Any]] = field(default_factory=list)
     stock_no_match: List[Dict[str, Any]] = field(default_factory=list)
     counts: Dict[str, int] = field(default_factory=dict)
-    blocking: List[str] = field(default_factory=list)
     reebelo_skus: List[str] = field(default_factory=list)
 
 
@@ -743,20 +691,30 @@ def apply_buffer(qty: int, buffer_max: int) -> int:
     return qty
 
 
-def run_sync(
-    pos_rows: List[PosRow],
-    reb_rows: List[RebRow],
-    registry: Registry,
-    opts: Options,
-) -> SyncResult:
+def run_sync(pos_rows: List[PosRow], reb_rows: List[RebRow], registry: Registry,
+             opts: Options, acc_rows: Optional[List[ACC.AccRow]] = None) -> SyncResult:
     res = SyncResult()
+    acc_rows = acc_rows or []
+    acc_enabled = bool(acc_rows)
+
     pos_by_id = {p.stock_id: p for p in pos_rows}
+    acc_by_id = {a.stock_id: a for a in acc_rows}
     reb_by_sku = {r.sku: r for r in reb_rows}
-    res.reebelo_skus = [r.sku for r in reb_rows if not r.is_brand_new]
+    res.reebelo_skus = [r.sku for r in reb_rows if not r.is_brand_new or (acc_enabled and r.is_accessory)]
 
     auto_locked, suggestions, pos_hints = build_auto_matches(pos_rows, reb_rows)
 
-    # ---------------- 1. build the locked map -----------------------------------
+    acc_locked: Dict[str, str] = {}
+    acc_notes: Dict[str, str] = {}
+    if acc_enabled:
+        reb_accs = [(r.sku, r.acc) for r in reb_rows if r.acc is not None]
+        acc_locked, acc_notes = ACC.build_accessory_matches(acc_rows, reb_accs)
+
+    def is_acc_listing(sku: str) -> bool:
+        r = reb_by_sku.get(sku)
+        return bool(r and r.is_brand_new)
+
+    # ---------------- 1. locked map ----------------------------------------------
     locked: Dict[str, List[str]] = {}
 
     def add_link(sku: str, pid: str, source: str):
@@ -764,37 +722,29 @@ def run_sync(
             return
         r = reb_by_sku.get(sku)
         if r is None:
-            res.error_rows.append({
-                "Severity": "Warning",
-                "Issue": f"{source}: Reebelo SKU '{sku}' is not in today's export - link kept but not uploaded.",
-            })
+            res.error_rows.append({"Severity": "Warning",
+                                   "Issue": f"{source}: Reebelo SKU '{sku}' is not in today's export - link kept but not uploaded."})
             return
-        if r.is_brand_new:
-            res.error_rows.append({
-                "Severity": "Warning",
-                "Issue": f"{source}: '{sku}' is a Brand New / accessory listing - skipped (handled manually).",
-            })
+        if r.is_brand_new and not acc_enabled:
+            res.error_rows.append({"Severity": "Warning",
+                                   "Issue": f"{source}: '{sku}' is a Brand New / accessory listing and no accessories POS report was uploaded - skipped."})
             return
         locked.setdefault(sku, [])
         if pid not in locked[sku]:
             locked[sku].append(pid)
 
-    # a) carried over from the registry - locked links NEVER drop
     for sku, ids in registry.locked.items():
         for pid in ids:
             add_link(sku, pid, "Locked Matches")
 
-    # b) reviewer decisions from Match Review
-    for sku, (dec, corrected, _note) in registry.review_decisions.items():
+    for sku, (dec, corrected, _n) in registry.review_decisions.items():
         if dec == DECISION_LINKED and corrected:
             add_link(sku, corrected, "Match Review decision")
 
-    # c) reviewer decisions from New Masterlist SKUs
-    for pid, (dec, sku, _note) in registry.newml_decisions.items():
+    for pid, (dec, sku, _n) in registry.newml_decisions.items():
         if dec == DECISION_LINKED and sku:
             add_link(sku, pid, "New Masterlist decision")
 
-    # d) first-run seeding / new exact matches
     already_linked_pos = {pid for ids in locked.values() for pid in ids}
     parked = set(registry.not_selling) | set(registry.not_yet)
     for pid, (dec, _sku, _n) in registry.newml_decisions.items():
@@ -811,58 +761,82 @@ def run_sync(
                 p = pos_by_id.get(pid)
                 if not p or p.qty <= 0:
                     continue
-                res.error_rows.append({
-                    "Severity": "Warning",
-                    "Issue": (
-                        f"Re-linked: Masterlist {pid} ({p.model} | {p.color}) was parked in "
-                        f"Not Selling / Not on Reebelo Yet but has {p.qty} in POS and an exact "
-                        f"Reebelo listing '{sku}' - moved back to Locked Matches."
-                    ),
-                })
+                res.error_rows.append({"Severity": "Warning",
+                                       "Issue": (f"Re-linked: Masterlist {pid} ({p.model} | {p.color}) was parked in "
+                                                 f"Not Selling / Not on Reebelo Yet but has {p.qty} in POS and an exact "
+                                                 f"Reebelo listing '{sku}' - moved back to Locked Matches.")})
             add_link(sku, pid, "Auto-match")
             already_linked_pos.add(pid)
 
-    linked_pos_ids = {pid for ids in locked.values() for pid in ids}
+        for sku, pid in acc_locked.items():
+            if sku in locked:
+                continue
+            add_link(sku, pid, "Accessory auto-match")
 
-    # ---------------- 2. locked rows + target stock ------------------------------
+    # ---------------- 2. shared accessory pools ----------------------------------
+    pool_users: Dict[str, int] = {}
+    for sku, ids in locked.items():
+        if not is_acc_listing(sku):
+            continue
+        for pid in ids:
+            if pid in acc_by_id:
+                pool_users[pid] = pool_users.get(pid, 0) + 1
+
+    # ---------------- 3. locked rows + target stock ------------------------------
     n_buffered = 0
+    n_shared = 0
     for sku in sorted(locked):
         r = reb_by_sku.get(sku)
-        ids = locked[sku]
         if r is None:
             continue
-        qty = 0
-        labels, missing = [], []
+        ids = locked[sku]
+        accessory = r.is_brand_new
+        qty, labels, missing, shared = 0, [], [], False
+
         for pid in ids:
-            p = pos_by_id.get(pid)
-            if p is None:
-                missing.append(pid)
-                labels.append(f"{pid}: (not in today's POS)")
-                continue
-            if p.excluded:
-                res.error_rows.append({
-                    "Severity": "Warning",
-                    "Issue": f"{sku}: Masterlist {pid} is {p.excluded} - counted as 0.",
-                })
-                labels.append(f"{pid}: {p.model} | {p.color} (EXCLUDED)")
-                continue
-            qty += max(0, p.qty)
-            labels.append(p.label)
-        target = apply_buffer(qty, opts.buffer_max)
+            if accessory:
+                a = acc_by_id.get(pid)
+                if a is None:
+                    missing.append(pid)
+                    labels.append(f"{pid}: (not in today's accessories POS)")
+                    continue
+                n_users = pool_users.get(pid, 1)
+                share = ACC.share_pool(a.qty, n_users, opts.share_threshold)
+                if n_users > 1:
+                    shared = True
+                    labels.append(f"{a.label} — pool {a.qty} shared by {n_users} listings → {share}")
+                else:
+                    labels.append(f"{a.label} (qty {a.qty})")
+                qty += share
+            else:
+                p = pos_by_id.get(pid)
+                if p is None:
+                    missing.append(pid)
+                    labels.append(f"{pid}: (not in today's POS)")
+                    continue
+                if p.excluded:
+                    res.error_rows.append({"Severity": "Warning",
+                                           "Issue": f"{sku}: Masterlist {pid} is {p.excluded} - counted as 0."})
+                    labels.append(f"{pid}: {p.model} | {p.color} (EXCLUDED)")
+                    continue
+                qty += max(0, p.qty)
+                labels.append(p.label)
+
+        if shared:
+            n_shared += 1
+        buf = opts.acc_buffer_max if accessory else opts.buffer_max
+        target = apply_buffer(qty, buf)
         if qty > 0 and target == 0:
             n_buffered += 1
         if missing:
-            res.error_rows.append({
-                "Severity": "Info",
-                "Issue": (f"{sku}: Masterlist ID(s) {', '.join(missing)} are not in today's POS "
-                          f"export (sold out) - counted as 0. Link kept."),
-            })
-        status = "Unchanged"
-        if target != r.stock_you:
-            status = "UPDATE"
+            res.error_rows.append({"Severity": "Info",
+                                   "Issue": (f"{sku}: Masterlist ID(s) {', '.join(missing)} are not in today's POS "
+                                             "export (sold out) - counted as 0. Link kept.")})
+        status = "UPDATE" if target != r.stock_you else "Unchanged"
         if qty > 0 and target == 0:
             status = "BUFFER → 0"
         res.locked_rows.append({
+            "Source": SRC_ACCESSORY if accessory else SRC_DEVICE,
             "Reebelo SKU": sku,
             "Reebelo Model Name": r.model_name,
             "Brand": r.brand,
@@ -881,15 +855,21 @@ def run_sync(
         if (not opts.changed_rows_only) or target != r.stock_you:
             res.upload_rows.append({"sku": sku, "price": "", "stock": target, "minprice": "", "market": ""})
 
-    # ---------------- 3. Match Review (Reebelo listings not linked) ---------------
+    # ---------------- 4. Match Review --------------------------------------------
     for r in reb_rows:
-        if r.is_brand_new or r.sku in locked:
+        if r.sku in locked:
             continue
+        if r.is_brand_new and not acc_enabled:
+            continue      # accessories stay manual until the accessories POS report is uploaded
         prev = registry.review_decisions.get(r.sku, ("", "", ""))
-        sugg_id, sugg_note = suggestions.get(r.sku, ("", ""))
+        if r.is_brand_new:
+            sugg_id, sugg_note = "", acc_notes.get(r.sku, "Brand New listing - no accessory match")
+        else:
+            sugg_id, sugg_note = suggestions.get(r.sku, ("", ""))
         note = prev[2] or sugg_note
-        p = pos_by_id.get(sugg_id) if sugg_id else None
+        src = acc_by_id.get(sugg_id) if (r.is_brand_new and sugg_id) else pos_by_id.get(sugg_id) if sugg_id else None
         res.review_rows.append({
+            "Source": SRC_ACCESSORY if r.is_brand_new else SRC_DEVICE,
             "Reebelo SKU": r.sku,
             "Reebelo Model Name": r.model_name,
             "Brand": r.brand,
@@ -898,33 +878,25 @@ def run_sync(
             "Condition": r.condition,
             "Storage": r.storage,
             "Current Seller Stock": r.stock_you,
-            "Suggested Masterlist ID": (f"{sugg_id}: {p.model} | {p.color}" if p else sugg_id),
+            "Suggested Masterlist ID": (f"{sugg_id}: {src.label}" if src is not None else sugg_id),
             "Corrected Masterlist ID": prev[1],
             "Reviewer Decision": prev[0],
             "Notes": note,
         })
         if r.stock_you > 0:
             res.stock_no_match.append({
-                "Reebelo SKU": r.sku,
-                "Reebelo Model Name": r.model_name,
-                "Color": r.color,
-                "Storage": r.storage,
-                "Current Stock (you)": r.stock_you,
+                "Source": SRC_ACCESSORY if r.is_brand_new else SRC_DEVICE,
+                "Reebelo SKU": r.sku, "Reebelo Model Name": r.model_name,
+                "Color": r.color, "Storage": r.storage, "Current Stock (you)": r.stock_you,
             })
-            res.error_rows.append({
-                "Severity": "Alert",
-                "Issue": (f"{r.sku} shows stock {r.stock_you} on Reebelo but has no confirmed POS "
-                          f"match - oversell risk. Left untouched; zero it manually or link it."),
-            })
+            res.error_rows.append({"Severity": "Alert",
+                                   "Issue": (f"{r.sku} shows stock {r.stock_you} on Reebelo but has no confirmed POS "
+                                             "match - oversell risk. Left untouched; zero it manually or link it.")})
 
-    # ---------------- 4. New Masterlist SKUs / parked tabs ------------------------
-    not_selling_ids, not_yet_ids = [], []
-    for pid in registry.not_selling:
-        if pid not in linked_pos_ids:
-            not_selling_ids.append(pid)
-    for pid in registry.not_yet:
-        if pid not in linked_pos_ids:
-            not_yet_ids.append(pid)
+    # ---------------- 5. New Masterlist SKUs / parked tabs ------------------------
+    linked_pos_ids = {pid for ids in locked.values() for pid in ids}
+    not_selling_ids = [p for p in registry.not_selling if p not in linked_pos_ids]
+    not_yet_ids = [p for p in registry.not_yet if p not in linked_pos_ids]
     for pid, (dec, _sku, _n) in registry.newml_decisions.items():
         if pid in linked_pos_ids:
             continue
@@ -935,65 +907,80 @@ def run_sync(
 
     def pos_block(pid: str) -> Dict[str, Any]:
         p = pos_by_id.get(pid)
-        return {
-            "Masterlist Stock Type ID": pid,
-            "Category": p.category if p else "",
-            "Brand": p.brand if p else "",
-            "Model": p.model if p else "(not in today's POS export)",
-            "Color": p.color if p else "",
-            "Available Qty": p.qty if p else 0,
-        }
+        a = acc_by_id.get(pid)
+        if p is not None:
+            return {"Source": SRC_DEVICE, "Masterlist Stock Type ID": pid, "Category": p.category,
+                    "Brand": p.brand, "Model": p.model, "Color": p.color, "Available Qty": p.qty}
+        if a is not None:
+            return {"Source": SRC_ACCESSORY, "Masterlist Stock Type ID": pid, "Category": a.category,
+                    "Brand": a.brand, "Model": a.model, "Color": a.color, "Available Qty": a.qty}
+        return {"Source": "", "Masterlist Stock Type ID": pid, "Category": "", "Brand": "",
+                "Model": "(not in today's POS export)", "Color": "", "Available Qty": 0}
 
     res.not_selling_rows = [pos_block(p) for p in dict.fromkeys(not_selling_ids)]
     res.not_yet_rows = [pos_block(p) for p in dict.fromkeys(not_yet_ids)]
 
     parked_now = set(not_selling_ids) | set(not_yet_ids)
     for p in pos_rows:
-        if p.stock_id in linked_pos_ids or p.stock_id in parked_now:
+        if p.stock_id in linked_pos_ids or p.stock_id in parked_now or p.excluded or p.qty <= 0:
             continue
-        if p.excluded:
-            continue
-        if p.qty <= 0:
-            continue  # only POS SKUs that actually have stock need a decision
         prev = registry.newml_decisions.get(p.stock_id, ("", "", ""))
         cand = [sku for sku, pid in auto_locked.items() if pid == p.stock_id]
         hint_sku, hint_note = pos_hints.get(p.stock_id, ("", ""))
         res.newml_rows.append({
-            "Masterlist Stock Type ID": p.stock_id,
-            "Category": p.category,
-            "Brand": p.brand,
-            "Model": p.model,
-            "Color": p.color,
-            "Available Qty": p.qty,
+            "Source": SRC_DEVICE,
+            "Masterlist Stock Type ID": p.stock_id, "Category": p.category, "Brand": p.brand,
+            "Model": p.model, "Color": p.color, "Available Qty": p.qty,
             "Suggested Reebelo SKU": (cand[0] if cand else hint_sku),
-            "Link to Reebelo SKU": prev[1],
-            "Reviewer Decision": prev[0],
+            "Link to Reebelo SKU": prev[1], "Reviewer Decision": prev[0],
             "Notes": prev[2] or hint_note or "No Reebelo listing found for this model / colour",
         })
 
-    # ---------------- 5. counts --------------------------------------------------
-    excluded_pos = [p for p in pos_rows if p.excluded]
-    for p in excluded_pos[:200]:
-        res.error_rows.append({
-            "Severity": "Info",
-            "Issue": f"POS {p.stock_id} {p.model} | {p.color}: skipped - {p.excluded}.",
+    # accessories: only the POS rows a reviewer actually has to decide on land here —
+    # one that was reviewed before, otherwise the tab would carry every case and glass in POS.
+    for a in acc_rows:
+        pid = a.stock_id
+        if pid in linked_pos_ids or pid in parked_now:
+            continue
+        prev = registry.newml_decisions.get(pid)
+        if not prev:
+            continue
+        res.newml_rows.append({
+            "Source": SRC_ACCESSORY,
+            "Masterlist Stock Type ID": pid, "Category": a.category, "Brand": a.brand,
+            "Model": a.model, "Color": a.color, "Available Qty": a.qty,
+            "Suggested Reebelo SKU": "", "Link to Reebelo SKU": prev[1],
+            "Reviewer Decision": prev[0], "Notes": prev[2],
         })
 
+    # ---------------- 6. counts --------------------------------------------------
+    excluded_pos = [p for p in pos_rows if p.excluded]
+    for p in excluded_pos[:200]:
+        res.error_rows.append({"Severity": "Info",
+                               "Issue": f"POS {p.stock_id} {p.model} | {p.color}: skipped - {p.excluded}."})
+
+    acc_locked_rows = [x for x in res.locked_rows if x["Source"] == SRC_ACCESSORY]
     res.counts = {
         "locked_total": len(res.locked_rows),
+        "locked_devices": len(res.locked_rows) - len(acc_locked_rows),
+        "locked_accessories": len(acc_locked_rows),
         "locked_updated": len(res.upload_rows),
         "locked_buffered": n_buffered,
+        "shared_pools": n_shared,
         "new_masterlist": len(res.newml_rows),
         "review": len(res.review_rows),
+        "review_accessories": len([x for x in res.review_rows if x["Source"] == SRC_ACCESSORY]),
         "not_selling": len(res.not_selling_rows),
         "not_yet": len(res.not_yet_rows),
         "errors": len([e for e in res.error_rows if e["Severity"] in ("Alert", "Error")]),
         "warnings": len([e for e in res.error_rows if e["Severity"] == "Warning"]),
         "unmatched_with_stock": len(res.stock_no_match),
-        "brand_new_skipped": len([r for r in reb_rows if r.is_brand_new]),
+        "brand_new_skipped": 0 if acc_enabled else len([r for r in reb_rows if r.is_brand_new]),
         "pos_used_rows": len(pos_rows),
+        "pos_acc_rows": len(acc_rows),
         "pos_excluded": len(excluded_pos),
         "reebelo_used_listings": len([r for r in reb_rows if not r.is_brand_new]),
+        "reebelo_acc_listings": len([r for r in reb_rows if r.is_brand_new]),
     }
     return res
 
@@ -1014,27 +1001,28 @@ MIN_W, MAX_W = 9.0, 95.0
 
 
 def _autofit(ws, headers: List[str], rows: List[List[Any]]):
-    """Size every column to its widest cell so no text is cut off."""
-    ncols = len(headers)
     widths = []
-    for i in range(ncols):
+    for i in range(len(headers)):
         longest = len(str(headers[i]))
         for r in rows:
-            if i < len(r):
-                v = r[i]
-                if v is None:
-                    continue
-                for line in str(v).split("\n"):
+            if i < len(r) and r[i] is not None:
+                for line in str(r[i]).split("\n"):
                     longest = max(longest, len(line))
         widths.append(min(max(longest + 3, MIN_W), MAX_W))
-    widths[0] = 6.0  # the "#" column
+    widths[0] = 6.0
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
-    return widths
+
+
+def _dv_list(fill_header: str, headers: List[str]) -> str:
+    """Build the 3-option dropdown, naming the column the reviewer must fill."""
+    letter = get_column_letter(headers.index(fill_header) + 2)   # +1 for the "#" column
+    return f'"Linked (fill col {letter}),{DECISION_NOT_SELLING},{DECISION_NOT_YET}"'
 
 
 def _write_sheet(wb, title: str, headers: List[str], rows: List[Dict[str, Any]],
-                 dv: Optional[Tuple[str, str]] = None, dv_rows: int = 700):
+                 dv_header: Optional[str] = None, dv_fill_header: Optional[str] = None,
+                 dv_rows: int = 700):
     ws = wb.create_sheet(title)
     all_headers = ["#"] + headers
     ws.append(all_headers)
@@ -1053,54 +1041,75 @@ def _write_sheet(wb, title: str, headers: List[str], rows: List[Dict[str, Any]],
         cell.alignment = Alignment(vertical="center", horizontal="left")
     ws.row_dimensions[1].height = 22
     ws.freeze_panes = "A2"
-
     _autofit(ws, all_headers, table)
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(all_headers))}{max(1, len(rows) + 1)}"
 
-    last = max(1, len(rows) + 1)
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(all_headers))}{last}"
-
-    if dv:
-        col_letter, formula = dv
-        validator = DataValidation(type="list", formula1=formula, allow_blank=True, showDropDown=False)
+    if dv_header and dv_fill_header:
+        col = get_column_letter(headers.index(dv_header) + 2)
+        validator = DataValidation(type="list", formula1=_dv_list(dv_fill_header, headers),
+                                   allow_blank=True, showDropDown=False)
         ws.add_data_validation(validator)
-        end = max(len(rows) + 1, dv_rows) + 200
-        validator.add(f"{col_letter}2:{col_letter}{end}")
+        validator.add(f"{col}2:{col}{max(len(rows) + 1, dv_rows) + 200}")
     return ws
+
+
+LOCKED_HEADERS = ["Source", "Reebelo SKU", "Reebelo Model Name", "Brand", "Category", "Color",
+                  "Condition", "Storage", "LOCKED Masterlist ID(s)", "Masterlist Model | Color",
+                  "POS Available Qty", "Current Stock (you)", "Target Stock", "In Upload CSV", "# IDs"]
+
+NEWML_HEADERS = ["Source", "Masterlist Stock Type ID", "Category", "Brand", "Model", "Color",
+                 "Available Qty", "Suggested Reebelo SKU", "Link to Reebelo SKU",
+                 "Reviewer Decision", "Notes"]
+
+REVIEW_HEADERS = ["Source", "Reebelo SKU", "Reebelo Model Name", "Brand", "Category", "Color",
+                  "Condition", "Storage", "Current Seller Stock", "Suggested Masterlist ID",
+                  "Corrected Masterlist ID", "Reviewer Decision", "Notes"]
+
+PARKED_HEADERS = ["Source", "Masterlist Stock Type ID", "Category", "Brand", "Model", "Color",
+                  "Available Qty"]
 
 
 def build_registry_workbook(res: SyncResult, run_date: date, opts: Options) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)
 
-    # ---- Summary -----------------------------------------------------------
     ws = wb.create_sheet(SHEET_SUMMARY)
     ws["B2"] = "Reebelo Stock Bulk Update — Match Review"
     ws["B2"].fill = PatternFill("solid", fgColor=TITLE_BG)
     ws["B2"].font = Font(bold=True, size=15, color="FF111111")
     ws["B3"] = (f"Mister Mobile Singapore · generated {date_tag(run_date)} · "
-                f"POS Masterlist → Reebelo (Cobalt)")
+                "POS Masterlist → Reebelo (Cobalt)")
     ws["B3"].font = Font(size=9, color="FF333333")
     c = res.counts
-    buf_txt = "off (exact POS qty)" if opts.buffer_max == 0 else f"1–{opts.buffer_max} units → 0"
+    dev_buf = "off (exact POS qty)" if opts.buffer_max == 0 else f"1–{opts.buffer_max} units → 0"
+    acc_buf = "off (exact POS qty)" if opts.acc_buffer_max == 0 else f"1–{opts.acc_buffer_max} units → 0"
     lines = [
         ("Locked Matches (total)", c.get("locked_total", 0)),
+        ("  · used devices", c.get("locked_devices", 0)),
+        ("  · accessories", c.get("locked_accessories", 0)),
         ("Locked Matches in upload CSV", c.get("locked_updated", 0)),
         ("Zeroed by oversell buffer", c.get("locked_buffered", 0)),
+        ("Accessory listings on a shared POS pool", c.get("shared_pools", 0)),
         ("New Masterlist SKUs to review", c.get("new_masterlist", 0)),
         ("Reebelo listings awaiting review", c.get("review", 0)),
+        ("  · of which accessories", c.get("review_accessories", 0)),
         ("Not Selling in Reebelo", c.get("not_selling", 0)),
         ("Not on Reebelo Yet", c.get("not_yet", 0)),
         ("Alerts (stock > 0, no POS match)", c.get("unmatched_with_stock", 0)),
         ("Warnings", c.get("warnings", 0)),
         ("Brand New / accessory listings skipped", c.get("brand_new_skipped", 0)),
-        ("POS used rows read", c.get("pos_used_rows", 0)),
+        ("POS used device rows read", c.get("pos_used_rows", 0)),
+        ("POS accessory rows read", c.get("pos_acc_rows", 0)),
         ("POS rows excluded (export sets / freebies)", c.get("pos_excluded", 0)),
         ("Reebelo used listings in export", c.get("reebelo_used_listings", 0)),
-        ("Oversell buffer used", buf_txt),
+        ("Reebelo accessory listings in export", c.get("reebelo_acc_listings", 0)),
+        ("Oversell buffer — devices", dev_buf),
+        ("Oversell buffer — accessories", acc_buf),
+        ("Shared pool rule", f"full qty at {opts.share_threshold}+ pieces, split evenly below"),
     ]
     r = 5
     for label, val in lines:
-        ws.cell(row=r, column=2, value=label).font = Font(bold=True)
+        ws.cell(row=r, column=2, value=label).font = Font(bold=not label.startswith("  "))
         ws.cell(row=r, column=3, value=val)
         r += 1
     ws.cell(row=r + 1, column=2,
@@ -1108,44 +1117,19 @@ def build_registry_workbook(res: SyncResult, run_date: date, opts: Options) -> b
                    "(columns kept, values empty) — stock only.")).font = Font(color="FFB00020", bold=True)
     ws.column_dimensions["A"].width = 4
     ws.column_dimensions["B"].width = 52
-    ws.column_dimensions["C"].width = 22
+    ws.column_dimensions["C"].width = 30
 
-    _write_sheet(
-        wb, SHEET_LOCKED,
-        ["Reebelo SKU", "Reebelo Model Name", "Brand", "Category", "Color", "Condition",
-         "Storage", "LOCKED Masterlist ID(s)", "Masterlist Model | Color", "POS Available Qty",
-         "Current Stock (you)", "Target Stock", "In Upload CSV", "# IDs"],
-        res.locked_rows,
-    )
-
-    _write_sheet(
-        wb, SHEET_NEW_ML,
-        ["Masterlist Stock Type ID", "Category", "Brand", "Model", "Color", "Available Qty",
-         "Suggested Reebelo SKU", "Link to Reebelo SKU", "Reviewer Decision", "Notes"],
-        res.newml_rows,
-        dv=("J", DV_NEWML),
-    )
-
-    _write_sheet(
-        wb, SHEET_REVIEW,
-        ["Reebelo SKU", "Reebelo Model Name", "Brand", "Category", "Color", "Condition",
-         "Storage", "Current Seller Stock", "Suggested Masterlist ID", "Corrected Masterlist ID",
-         "Reviewer Decision", "Notes"],
-        res.review_rows,
-        dv=("L", DV_REVIEW),
-    )
-
-    for title, rows in ((SHEET_NOT_SELLING, res.not_selling_rows), (SHEET_NOT_YET, res.not_yet_rows)):
-        _write_sheet(
-            wb, title,
-            ["Masterlist Stock Type ID", "Category", "Brand", "Model", "Color", "Available Qty"],
-            rows,
-        )
-
+    _write_sheet(wb, SHEET_LOCKED, LOCKED_HEADERS, res.locked_rows)
+    _write_sheet(wb, SHEET_NEW_ML, NEWML_HEADERS, res.newml_rows,
+                 dv_header="Reviewer Decision", dv_fill_header="Link to Reebelo SKU")
+    _write_sheet(wb, SHEET_REVIEW, REVIEW_HEADERS, res.review_rows,
+                 dv_header="Reviewer Decision", dv_fill_header="Corrected Masterlist ID")
+    _write_sheet(wb, SHEET_NOT_SELLING, PARKED_HEADERS, res.not_selling_rows)
+    _write_sheet(wb, SHEET_NOT_YET, PARKED_HEADERS, res.not_yet_rows)
     _write_sheet(wb, SHEET_ERRORS, ["Severity", "Issue"], res.error_rows)
 
     ws = wb.create_sheet(SHEET_SKUS)
-    ws.append(["Reebelo SKU (used listings only)"])
+    ws.append(["Reebelo SKU"])
     ws["A1"].fill = PatternFill("solid", fgColor=HEADER_BG)
     ws["A1"].font = Font(bold=True, color=HEADER_FG)
     for s in res.reebelo_skus:
