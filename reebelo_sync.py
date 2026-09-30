@@ -25,6 +25,7 @@ LOCKED RULES
 from __future__ import annotations
 
 import io
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -73,7 +74,6 @@ REEBELO_REQUIRED_COLS = [
 
 UPLOAD_HEADERS = ["sku", "price", "stock", "minprice", "market"]
 
-# Export-set / regional tokens that must never be sold on Reebelo SG
 EXPORT_TOKENS = {
     "JP", "TH", "TW", "HK", "CN", "KR", "MY", "VN", "US", "IND", "INDO", "INDIA",
     "PY", "CH", "UK", "EU", "UAE", "AUS", "GER", "LL", "ZA", "PH", "CA", "MOR",
@@ -224,16 +224,69 @@ def ram_of(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def _rewind(f):
+# ----------------------------------------------------------------------------------
+# File reading — every upload is copied into a fresh BytesIO first.
+# Streamlit UploadedFile objects keep their read position between reruns, and pandas
+# refuses anything that is not a real buffer, so never hand it the upload directly.
+# ----------------------------------------------------------------------------------
+def _flatten(x) -> List[Any]:
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple, set)):
+        out = []
+        for i in x:
+            out.extend(_flatten(i))
+        return out
+    return [x]
+
+
+def _file_name(f) -> str:
+    if isinstance(f, (str, bytes, os.PathLike)):
+        return str(f)
+    return str(getattr(f, "name", "") or "")
+
+
+def _to_buffer(f) -> io.BytesIO:
+    """Return a rewound BytesIO for a path, bytes, or any file-like upload."""
+    if isinstance(f, io.BytesIO):
+        f.seek(0)
+        return io.BytesIO(f.getvalue())
+    if isinstance(f, (bytes, bytearray)):
+        return io.BytesIO(bytes(f))
+    if isinstance(f, (str, os.PathLike)):
+        with open(f, "rb") as fh:
+            return io.BytesIO(fh.read())
     try:
         f.seek(0)
     except Exception:
         pass
-    return f
+    data = f.read()
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    try:
+        f.seek(0)
+    except Exception:
+        pass
+    return io.BytesIO(data)
 
 
-def _read_grid(file_like):
-    wb = load_workbook(_rewind(file_like), data_only=True, read_only=True)
+def _read_table(f) -> pd.DataFrame:
+    """Read one uploaded CSV / Excel file into a DataFrame of strings."""
+    buf = _to_buffer(f)
+    name = _file_name(f).lower()
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(buf, dtype=str)
+    if name.endswith((".csv", ".txt", ".tsv")):
+        return pd.read_csv(buf, dtype=str)
+    try:                                   # no usable extension - try CSV, then Excel
+        return pd.read_csv(buf, dtype=str)
+    except Exception:
+        buf.seek(0)
+        return pd.read_excel(buf, dtype=str)
+
+
+def _read_grid(file_like) -> List[List[Any]]:
+    wb = load_workbook(_to_buffer(file_like), data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
     return [list(r) for r in ws.iter_rows(values_only=True)]
 
@@ -279,7 +332,12 @@ def _strip_model_code(model: str) -> str:
 
 def load_pos(file_like) -> Tuple[List[PosRow], List[str]]:
     errors: List[str] = []
-    grid = _read_grid(file_like)
+    if file_like is None:
+        return [], ["No POS Masterlist uploaded."]
+    try:
+        grid = _read_grid(file_like)
+    except Exception as exc:
+        return [], [f"POS Masterlist could not be read: {exc}"]
     if len(grid) < 3:
         return [], ["POS Masterlist: file has no data rows."]
     head1 = [_s(x) for x in grid[0]]
@@ -338,7 +396,10 @@ def load_pos(file_like) -> Tuple[List[PosRow], List[str]]:
 def load_pos_accessories(file_like) -> Tuple[List[ACC.AccRow], List[str]]:
     if file_like is None:
         return [], []
-    grid = _read_grid(file_like)
+    try:
+        grid = _read_grid(file_like)
+    except Exception as exc:
+        return [], [f"POS Accessories report could not be read: {exc}"]
     if len(grid) < 3:
         return [], ["POS Accessories: file has no data rows."]
     head1 = [_s(x) for x in grid[0]]
@@ -362,8 +423,7 @@ def load_pos_accessories(file_like) -> Tuple[List[ACC.AccRow], List[str]]:
             _s(raw[4] if len(raw) > 4 else ""),
             _int(raw[qty_idx] if qty_idx < len(raw) else 0),
         ))
-    errs = [] if rows else ["POS Accessories: no data rows were found."]
-    return rows, errs
+    return rows, ([] if rows else ["POS Accessories: no data rows were found."])
 
 
 # ----------------------------------------------------------------------------------
@@ -390,7 +450,7 @@ class RebRow:
     conn: str = ""
     tokens: frozenset = field(default_factory=frozenset)
     color_norm: str = ""
-    acc: Optional[ACC.RebAcc] = None      # accessory parse, when the SKU is an MMACC listing
+    acc: Optional[ACC.RebAcc] = None
 
     @property
     def is_accessory(self) -> bool:
@@ -411,25 +471,25 @@ def _reb_model_base(model_name: str, brand: str, storage: str) -> str:
 
 
 def load_reebelo(files, filename: str = "") -> Tuple[List[RebRow], pd.DataFrame, List[str]]:
-    """`files` is one uploaded file or a list of them (a full export plus, say, an
+    """`files` may be a single upload or a list of them (e.g. the full export plus an
        accessories-only export). Later files win on duplicate SKUs."""
     errors: List[str] = []
-    if files is None:
+    items = _flatten(files)
+    if not items:
         return [], pd.DataFrame(), ["No Reebelo inventory file uploaded."]
-    if not isinstance(files, (list, tuple)):
-        files = [files]
 
     frames = []
-    for f in files:
-        name = (getattr(f, "name", "") or filename or "").lower()
-        f = _rewind(f)
-        df = pd.read_excel(f, dtype=str) if name.endswith((".xlsx", ".xlsm", ".xls")) \
-            else pd.read_csv(f, dtype=str)
+    for f in items:
+        label = _file_name(f) or filename or "uploaded file"
+        try:
+            df = _read_table(f)
+        except Exception as exc:
+            errors.append(f"Reebelo file '{label}' could not be read: {exc}")
+            continue
         df.columns = [str(c).strip() for c in df.columns]
         missing = [c for c in REEBELO_REQUIRED_COLS if c not in df.columns]
         if missing:
-            errors.append(f"Reebelo file '{getattr(f, 'name', 'uploaded file')}' is missing "
-                          "required column(s): " + ", ".join(missing))
+            errors.append(f"Reebelo file '{label}' is missing required column(s): " + ", ".join(missing))
             continue
         frames.append(df)
     if errors or not frames:
@@ -611,7 +671,10 @@ def load_registry(file_like) -> Tuple[Registry, List[str]]:
     errors: List[str] = []
     if file_like is None:
         return reg, errors
-    wb = load_workbook(_rewind(file_like), data_only=True, read_only=True)
+    try:
+        wb = load_workbook(_to_buffer(file_like), data_only=True, read_only=True)
+    except Exception as exc:
+        return reg, [f"SKU Registry could not be read: {exc}"]
     missing = [s for s in REQUIRED_REGISTRY_SHEETS if s not in wb.sheetnames]
     if missing:
         errors.append("SKU Registry is missing worksheet(s): " + ", ".join(missing))
@@ -661,9 +724,9 @@ def load_registry(file_like) -> Tuple[Registry, List[str]]:
 # ----------------------------------------------------------------------------------
 @dataclass
 class Options:
-    buffer_max: int = 2             # used devices: POS qty <= buffer_max becomes 0
-    acc_buffer_max: int = 0         # accessories: their own buffer (default none)
-    share_threshold: int = 30       # shared accessory pool: full qty above this, split below
+    buffer_max: int = 2
+    acc_buffer_max: int = 0
+    share_threshold: int = 30
     relink_returning: bool = True
     changed_rows_only: bool = True
     seed_auto_lock: bool = True
@@ -710,11 +773,6 @@ def run_sync(pos_rows: List[PosRow], reb_rows: List[RebRow], registry: Registry,
         reb_accs = [(r.sku, r.acc) for r in reb_rows if r.acc is not None]
         acc_locked, acc_notes = ACC.build_accessory_matches(acc_rows, reb_accs)
 
-    def is_acc_listing(sku: str) -> bool:
-        r = reb_by_sku.get(sku)
-        return bool(r and r.is_brand_new)
-
-    # ---------------- 1. locked map ----------------------------------------------
     locked: Dict[str, List[str]] = {}
 
     def add_link(sku: str, pid: str, source: str):
@@ -773,16 +831,15 @@ def run_sync(pos_rows: List[PosRow], reb_rows: List[RebRow], registry: Registry,
                 continue
             add_link(sku, pid, "Accessory auto-match")
 
-    # ---------------- 2. shared accessory pools ----------------------------------
     pool_users: Dict[str, int] = {}
     for sku, ids in locked.items():
-        if not is_acc_listing(sku):
+        r = reb_by_sku.get(sku)
+        if r is None or not r.is_brand_new:
             continue
         for pid in ids:
             if pid in acc_by_id:
                 pool_users[pid] = pool_users.get(pid, 0) + 1
 
-    # ---------------- 3. locked rows + target stock ------------------------------
     n_buffered = 0
     n_shared = 0
     for sku in sorted(locked):
@@ -855,12 +912,11 @@ def run_sync(pos_rows: List[PosRow], reb_rows: List[RebRow], registry: Registry,
         if (not opts.changed_rows_only) or target != r.stock_you:
             res.upload_rows.append({"sku": sku, "price": "", "stock": target, "minprice": "", "market": ""})
 
-    # ---------------- 4. Match Review --------------------------------------------
     for r in reb_rows:
         if r.sku in locked:
             continue
         if r.is_brand_new and not acc_enabled:
-            continue      # accessories stay manual until the accessories POS report is uploaded
+            continue
         prev = registry.review_decisions.get(r.sku, ("", "", ""))
         if r.is_brand_new:
             sugg_id, sugg_note = "", acc_notes.get(r.sku, "Brand New listing - no accessory match")
@@ -893,7 +949,6 @@ def run_sync(pos_rows: List[PosRow], reb_rows: List[RebRow], registry: Registry,
                                    "Issue": (f"{r.sku} shows stock {r.stock_you} on Reebelo but has no confirmed POS "
                                              "match - oversell risk. Left untouched; zero it manually or link it.")})
 
-    # ---------------- 5. New Masterlist SKUs / parked tabs ------------------------
     linked_pos_ids = {pid for ids in locked.values() for pid in ids}
     not_selling_ids = [p for p in registry.not_selling if p not in linked_pos_ids]
     not_yet_ids = [p for p in registry.not_yet if p not in linked_pos_ids]
@@ -936,8 +991,8 @@ def run_sync(pos_rows: List[PosRow], reb_rows: List[RebRow], registry: Registry,
             "Notes": prev[2] or hint_note or "No Reebelo listing found for this model / colour",
         })
 
-    # accessories: only the POS rows a reviewer actually has to decide on land here —
-    # one that was reviewed before, otherwise the tab would carry every case and glass in POS.
+    # accessories: only rows a reviewer already touched, otherwise every case and glass
+    # in POS (~1,000 rows) would flood this tab.
     for a in acc_rows:
         pid = a.stock_id
         if pid in linked_pos_ids or pid in parked_now:
@@ -953,7 +1008,6 @@ def run_sync(pos_rows: List[PosRow], reb_rows: List[RebRow], registry: Registry,
             "Reviewer Decision": prev[0], "Notes": prev[2],
         })
 
-    # ---------------- 6. counts --------------------------------------------------
     excluded_pos = [p for p in pos_rows if p.excluded]
     for p in excluded_pos[:200]:
         res.error_rows.append({"Severity": "Info",
@@ -1015,7 +1069,6 @@ def _autofit(ws, headers: List[str], rows: List[List[Any]]):
 
 
 def _dv_list(fill_header: str, headers: List[str]) -> str:
-    """Build the 3-option dropdown, naming the column the reviewer must fill."""
     letter = get_column_letter(headers.index(fill_header) + 2)   # +1 for the "#" column
     return f'"Linked (fill col {letter}),{DECISION_NOT_SELLING},{DECISION_NOT_YET}"'
 
