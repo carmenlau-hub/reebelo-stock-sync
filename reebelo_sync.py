@@ -271,14 +271,13 @@ def _to_buffer(f) -> io.BytesIO:
 
 
 def _read_table(f) -> pd.DataFrame:
-    """Read one uploaded CSV / Excel file into a DataFrame of strings."""
     buf = _to_buffer(f)
     name = _file_name(f).lower()
     if name.endswith((".xlsx", ".xlsm", ".xls")):
         return pd.read_excel(buf, dtype=str)
     if name.endswith((".csv", ".txt", ".tsv")):
         return pd.read_csv(buf, dtype=str)
-    try:                                   # no usable extension - try CSV, then Excel
+    try:
         return pd.read_csv(buf, dtype=str)
     except Exception:
         buf.seek(0)
@@ -471,8 +470,7 @@ def _reb_model_base(model_name: str, brand: str, storage: str) -> str:
 
 
 def load_reebelo(files, filename: str = "") -> Tuple[List[RebRow], pd.DataFrame, List[str]]:
-    """`files` may be a single upload or a list of them (e.g. the full export plus an
-       accessories-only export). Later files win on duplicate SKUs."""
+    """`files` may be a single upload or a list of them. Later files win on duplicate SKUs."""
     errors: List[str] = []
     items = _flatten(files)
     if not items:
@@ -991,8 +989,6 @@ def run_sync(pos_rows: List[PosRow], reb_rows: List[RebRow], registry: Registry,
             "Notes": prev[2] or hint_note or "No Reebelo listing found for this model / colour",
         })
 
-    # accessories: only rows a reviewer already touched, otherwise every case and glass
-    # in POS (~1,000 rows) would flood this tab.
     for a in acc_rows:
         pid = a.stock_id
         if pid in linked_pos_ids or pid in parked_now:
@@ -1134,31 +1130,22 @@ def build_registry_workbook(res: SyncResult, run_date: date, opts: Options) -> b
                 "POS Masterlist → Reebelo (Cobalt)")
     ws["B3"].font = Font(size=9, color="FF333333")
     c = res.counts
-    dev_buf = "off (exact POS qty)" if opts.buffer_max == 0 else f"1–{opts.buffer_max} units → 0"
-    acc_buf = "off (exact POS qty)" if opts.acc_buffer_max == 0 else f"1–{opts.acc_buffer_max} units → 0"
+
+    # Summary = only these lines (confirmed with Carmen, 14 Oct 2026).
+    # Everything else (buffer settings, alerts, warnings, excluded rows) lives on the
+    # Validation Errors tab and in the app's own validation summary.
     lines = [
         ("Locked Matches (total)", c.get("locked_total", 0)),
         ("  · used devices", c.get("locked_devices", 0)),
         ("  · accessories", c.get("locked_accessories", 0)),
         ("Locked Matches in upload CSV", c.get("locked_updated", 0)),
-        ("Zeroed by oversell buffer", c.get("locked_buffered", 0)),
-        ("Accessory listings on a shared POS pool", c.get("shared_pools", 0)),
         ("New Masterlist SKUs to review", c.get("new_masterlist", 0)),
-        ("Reebelo listings awaiting review", c.get("review", 0)),
-        ("  · of which accessories", c.get("review_accessories", 0)),
         ("Not Selling in Reebelo", c.get("not_selling", 0)),
         ("Not on Reebelo Yet", c.get("not_yet", 0)),
-        ("Alerts (stock > 0, no POS match)", c.get("unmatched_with_stock", 0)),
-        ("Warnings", c.get("warnings", 0)),
-        ("Brand New / accessory listings skipped", c.get("brand_new_skipped", 0)),
         ("POS used device rows read", c.get("pos_used_rows", 0)),
         ("POS accessory rows read", c.get("pos_acc_rows", 0)),
-        ("POS rows excluded (export sets / freebies)", c.get("pos_excluded", 0)),
         ("Reebelo used listings in export", c.get("reebelo_used_listings", 0)),
         ("Reebelo accessory listings in export", c.get("reebelo_acc_listings", 0)),
-        ("Oversell buffer — devices", dev_buf),
-        ("Oversell buffer — accessories", acc_buf),
-        ("Shared pool rule", f"full qty at {opts.share_threshold}+ pieces, split evenly below"),
     ]
     r = 5
     for label, val in lines:
@@ -1170,7 +1157,7 @@ def build_registry_workbook(res: SyncResult, run_date: date, opts: Options) -> b
                    "(columns kept, values empty) — stock only.")).font = Font(color="FFB00020", bold=True)
     ws.column_dimensions["A"].width = 4
     ws.column_dimensions["B"].width = 52
-    ws.column_dimensions["C"].width = 30
+    ws.column_dimensions["C"].width = 18
 
     _write_sheet(wb, SHEET_LOCKED, LOCKED_HEADERS, res.locked_rows)
     _write_sheet(wb, SHEET_NEW_ML, NEWML_HEADERS, res.newml_rows,
